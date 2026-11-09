@@ -14,7 +14,7 @@ Day-by-day notes and screenshots: [WEB2_progress.md](WEB2_progress.md).
 | M2: free settings, the estimate panel, progress over Server-Sent Events | done | 09a8aed |
 | M3: wrfpost products (33 surface fields, 6 levels, soundings, series) and tests | done | 09a8aed |
 | M4: the Turkish WebGL2 viewer, comparison, export, themes, phone layout, Pages samples | done | 8fd3674 |
-| M5: end-to-end test, failure handling, performance, docs | done | the commit of this report |
+| M5: end-to-end test, failure handling, performance, docs | done | fe7165c |
 
 ## Performance on the RTX 2060
 

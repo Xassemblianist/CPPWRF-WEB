@@ -13,7 +13,7 @@ bit-identical to WRF real*8.
 **Result: the wasm build is bit-identical to the native build.** All hashes match, and the wrfout file is the
 same byte for byte. This holds under node and in Chromium, for both cases ([docs/WEB1_report.md](docs/WEB1_report.md)).
 
-**Live page:** <https://xassemblianist.github.io/CPPWRF-WEB/>
+**Live pages:** the forecast site <https://xassemblianist.github.io/CPPWRF-WEB/> (also `/forecast/`); this WebAssembly page <https://xassemblianist.github.io/CPPWRF-WEB/web1.html>
 
 ## The forecast site (WEB2)
 

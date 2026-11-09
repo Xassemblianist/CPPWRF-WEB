@@ -1,0 +1,88 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>CPPWRF Tahmin</title>
+<meta name="description" content="CPPWRF ile bu bilgisayarda çalışan sayısal hava tahmini">
+<meta name="theme-color" content="#0b131e">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%232a7de1'/%3E%3Cpath d='M5 10h9a2.5 2.5 0 1 0-2.5-2.5M5 14h12a2.5 2.5 0 1 1-2.5 2.5' stroke='white' stroke-width='2' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="css/app.css">
+<script>
+  // the theme before the first paint (the page is dark by default)
+  // (?theme=light|dark in the address wins, for links and the page tests)
+  try { const t = new URLSearchParams(location.search).get("theme") || JSON.parse(localStorage.getItem("cppwrf.theme")); if (t) document.documentElement.dataset.theme = t; } catch {}
+</script>
+</head>
+<body>
+<div id="map" aria-label="Harita">
+  <canvas class="gl"></canvas>
+  <canvas class="flow" aria-hidden="true"></canvas>
+  <canvas class="ovl" tabindex="0" aria-label="Harita: sürükleyerek kaydırın, tekerlekle yakınlaştırın, tıklayarak nokta seçin"></canvas>
+</div>
+
+<header id="top">
+  <div id="brand" class="panel">
+    <button class="icon-btn" id="menuBtn" data-i18n-title="ui.menu" aria-expanded="true" aria-controls="drawer">
+      <svg class="i" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+    </button>
+    <span class="logo" aria-hidden="true"><svg class="i" viewBox="0 0 24 24"><path d="M3 10h11a3 3 0 1 0-3-3M3 15h15a3 3 0 1 1-3 3"/></svg></span>
+    <h1 data-i18n="app.title">CPPWRF Tahmin</h1>
+  </div>
+  <div id="search" class="panel" role="combobox" aria-expanded="false" aria-owns="searchList" aria-haspopup="listbox">
+    <svg class="i" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>
+    <input id="searchInput" type="search" autocomplete="off" aria-autocomplete="list" aria-controls="searchList" data-i18n-ph="ui.search">
+    <ul id="searchList" class="panel" role="listbox" hidden></ul>
+  </div>
+  <div id="sys" class="panel" role="status" aria-live="polite"><i class="dot"></i><span class="txt" data-i18n="sys.connecting">bağlanıyor…</span></div>
+  <div id="tools" class="panel">
+    <button class="icon-btn" id="shareBtn" data-i18n-title="ui.share"><svg class="i" viewBox="0 0 24 24"><path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/></svg></button>
+    <button class="icon-btn" id="exportBtn" data-i18n-title="export.title"><svg class="i" viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5M4 19h16"/></svg></button>
+    <button class="icon-btn" id="unitsBtn" data-i18n-title="units.title"><svg class="i" viewBox="0 0 24 24"><path d="M4 7h10M4 17h6M18 7h2M14 17h6"/><circle cx="16" cy="7" r="2"/><circle cx="12" cy="17" r="2"/></svg></button>
+    <button class="icon-btn" id="themeBtn" data-i18n-title="ui.theme"><svg class="i" viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></svg></button>
+    <button class="icon-btn" id="langBtn" data-i18n-title="ui.lang"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18"/></svg></button>
+    <a class="icon-btn" id="helpBtn" href="help.html" data-i18n-title="ui.help"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9.5 9a2.5 2.5 0 1 1 3.5 2.3c-.6.3-1 .9-1 1.6V14M12 17.5v.01"/></svg></a>
+  </div>
+</header>
+
+<aside id="drawer" class="panel" aria-label="Tahmin paneli">
+  <div class="tabs" role="tablist">
+    <button role="tab" id="tab-new" aria-selected="true" aria-controls="pane-new" data-i18n="tab.new">Yeni tahmin</button>
+    <button role="tab" id="tab-runs" aria-selected="false" aria-controls="pane-runs" data-i18n="tab.runs">Çalışmalar</button>
+    <button role="tab" id="tab-points" aria-selected="false" aria-controls="pane-points" data-i18n="tab.points">Noktalar</button>
+  </div>
+  <section class="tabpane" id="pane-new" role="tabpanel" aria-labelledby="tab-new"></section>
+  <section class="tabpane" id="pane-runs" role="tabpanel" aria-labelledby="tab-runs" hidden></section>
+  <section class="tabpane" id="pane-points" role="tabpanel" aria-labelledby="tab-points" hidden></section>
+</aside>
+
+<nav id="rail" class="panel" aria-label="Katmanlar"></nav>
+<div id="layerbox" class="panel" hidden></div>
+<div id="progress" class="panel" hidden role="region" aria-live="polite"></div>
+<div id="cmpbar" class="panel" hidden></div>
+<div id="splitline" hidden><span class="a">A</span><span class="b">B</span></div>
+
+<div id="legend" class="panel" hidden aria-live="polite"></div>
+<div id="timebar" class="panel" hidden>
+  <button class="icon-btn" id="prevBtn" data-i18n-title="time.prev"><svg class="i" viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg></button>
+  <button class="icon-btn" id="playBtn" data-i18n-title="time.play"><svg class="i" viewBox="0 0 24 24"><path d="M7 5l12 7-12 7z"/></svg></button>
+  <button class="icon-btn" id="nextBtn" data-i18n-title="time.next"><svg class="i" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>
+  <div class="now" id="nowLabel"></div>
+  <div id="ticks" role="slider" tabindex="0" aria-valuemin="0"></div>
+</div>
+<div id="probe" class="panel" hidden></div>
+<div id="card" class="panel" hidden role="dialog" aria-labelledby="cardTitle"></div>
+<div id="toast" class="panel" hidden role="status"></div>
+<dialog id="dlg"><form method="dialog"><div id="dlgBody"></div><menu id="dlgMenu"></menu></form></dialog>
+
+<footer id="foot">
+  <span id="cppwrfTag">CPPWRF</span>
+  <span id="runTag"></span>
+  <span class="sp"></span>
+  <span class="disc" data-i18n="app.disclaimer"></span>
+  <span class="lic" data-i18n="footer.license"></span>
+</footer>
+<script type="module" src="js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,127 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CPPWRF Forecast</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230e1726'/%3E%3Cpath d='M6 12h14a4 4 0 1 0-4-4M6 17h19a4 4 0 1 1-4 4M6 22h8' stroke='%237cc4ff' stroke-width='2.4' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+</head>
+<body>
+<div id="map">
+  <canvas id="base"></canvas>
+  <canvas id="flow"></canvas>
+  <canvas id="over"></canvas>
+</div>
+
+<header class="brand glass">
+  <svg viewBox="0 0 32 32" aria-hidden="true"><path d="M6 12h14a4 4 0 1 0-4-4M6 17h19a4 4 0 1 1-4 4M6 22h8"/></svg>
+  <div>
+    <b>CPPWRF Forecast</b>
+    <span id="sys" class="mono">connecting…</span>
+  </div>
+</header>
+
+<aside class="panel glass" id="panel">
+  <nav class="tabs" role="tablist">
+    <button role="tab" aria-selected="true" data-tab="new">New forecast</button>
+    <button role="tab" aria-selected="false" data-tab="runs">Runs <span id="runs-count" class="count"></span></button>
+  </nav>
+
+  <section data-pane="new">
+    <p class="hint" id="pick-hint">Click the map to place the centre of the domain.</p>
+    <div class="field two">
+      <label>Centre <output id="o-centre" class="mono">–</output></label>
+    </div>
+    <div class="field">
+      <label for="dx">Grid spacing <output id="o-dx" class="mono"></output></label>
+      <input id="dx" type="range" min="3" max="30" step="1" value="12">
+    </div>
+    <div class="field">
+      <label for="nx">Points west–east <output id="o-nx" class="mono"></output></label>
+      <input id="nx" type="range" min="20" max="150" step="1" value="100">
+    </div>
+    <div class="field">
+      <label for="ny">Points south–north <output id="o-ny" class="mono"></output></label>
+      <input id="ny" type="range" min="20" max="150" step="1" value="90">
+    </div>
+    <div class="field">
+      <label for="nz">Vertical levels <output id="o-nz" class="mono"></output></label>
+      <input id="nz" type="range" min="25" max="45" step="1" value="40">
+    </div>
+    <div class="field">
+      <label for="hours">Forecast length <output id="o-hours" class="mono"></output></label>
+      <input id="hours" type="range" min="1" max="24" step="1" value="12">
+    </div>
+    <div class="field">
+      <label>Model</label>
+      <div class="seg" role="group" aria-label="Backend">
+        <button type="button" data-backend="gpu-fp32" aria-pressed="true"><b>GPU · FP32</b><span>fast</span></button>
+        <button type="button" data-backend="cpu-fp64" aria-pressed="false"><b>CPU · FP64</b><span>WRF-identical</span></button>
+      </div>
+    </div>
+    <div class="field">
+      <label>Physics suite</label>
+      <div class="seg" role="group" aria-label="Physics suite">
+        <button type="button" data-suite="CONUS" aria-pressed="true"><b>CONUS</b><span>mid-latitudes</span></button>
+        <button type="button" data-suite="tropical" aria-pressed="false"><b>Tropical</b><span>low latitudes</span></button>
+      </div>
+    </div>
+    <dl class="est" id="est">
+      <div><dt>Area</dt><dd id="e-area" class="mono">–</dd></div>
+      <div><dt>GPU memory</dt><dd id="e-gpu" class="mono">–</dd></div>
+      <div><dt>Disk</dt><dd id="e-disk" class="mono">–</dd></div>
+      <div><dt>GFS cycle</dt><dd id="e-cycle" class="mono">–</dd></div>
+    </dl>
+    <p class="msg" id="est-msg" hidden></p>
+    <button id="start" class="primary" type="button" disabled>Run forecast</button>
+  </section>
+
+  <section data-pane="runs" hidden>
+    <div id="runs" class="runs"></div>
+  </section>
+</aside>
+
+<section class="job glass" id="job" hidden aria-live="polite">
+  <div class="job-head">
+    <div>
+      <b id="job-title">Forecast</b>
+      <span id="job-sub" class="mono"></span>
+    </div>
+    <button id="cancel" class="ghost" type="button">Cancel</button>
+  </div>
+  <ol class="stages" id="stages"></ol>
+  <p class="msg" id="job-msg" hidden></p>
+  <details id="job-log-box"><summary>Log</summary><pre id="job-log"></pre></details>
+</section>
+
+<nav class="layers glass" id="layers" aria-label="Layers"></nav>
+
+<div class="legend glass" id="legend" hidden>
+  <span id="legend-title"></span>
+  <div class="ramp" id="legend-ramp"></div>
+  <div class="ticks mono" id="legend-ticks"></div>
+</div>
+
+<div class="probe glass mono" id="probe" hidden></div>
+
+<footer class="timebar glass" id="timebar" hidden>
+  <button id="play" class="round" type="button" aria-label="Play">
+    <svg viewBox="0 0 24 24"><path id="play-icon" d="M8 5v14l11-7z"/></svg>
+  </button>
+  <div class="track">
+    <div class="ticks-row" id="time-ticks"></div>
+    <input id="time" type="range" min="0" max="0" value="0" step="1" aria-label="Forecast time">
+  </div>
+  <div class="now">
+    <b id="t-local"></b>
+    <span id="t-lead" class="mono"></span>
+  </div>
+  <a id="dl" class="ghost small" download>wrfout</a>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>

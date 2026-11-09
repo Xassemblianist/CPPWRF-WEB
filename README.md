@@ -15,6 +15,14 @@ same byte for byte. This holds under node and in Chromium, for both cases ([docs
 
 **Live page:** <https://xassemblianist.github.io/CPPWRF-WEB/>
 
+## Local forecast
+
+`forecast/` runs real-data forecasts on your own machine and shows them on a map. A small server on 127.0.0.1
+takes a region and a length from the page and runs GFS → WPS 4.6.0 → `cppwrf_real` → `cppwrf` on the GPU (FP32) or
+the CPU (FP64, WRF-identical). The page then shows wind particles, temperature, rain, humidity, pressure and cloud
+over time. Limits: 150 × 150 × 45 points, 24 h, and a GPU memory and disk check before each run. See
+[docs/FORECAST.md](docs/FORECAST.md).
+
 ## How bit identity survives the trip to wasm
 
 1. **No FMA contraction, no fast-math.** The build uses `-ffp-contract=off` and refuses fast-math flags. The
@@ -88,7 +96,8 @@ from the native build with `tools/nc_hashes.py`. The page computes the same hash
 | `expected/` | the native build's SHA-256 per variable and output time |
 | `tests/` | the math check (`math_bits.cpp`) and the headless node run (`run_node.mjs`) |
 | `tools/` | the builds of NetCDF-C and of the site, and the hash tool (`nc_hashes.py`) |
-| `upstream-patches/` | suggested changes to CPPWRF (none is needed) |
+| `forecast/` | the local forecast: the pipeline, the server and post-processor (`server/`), the map page (`web/`) |
+| `upstream-patches/` | changes to CPPWRF; the ones in `REQUIRED` are applied to a copy by `tools/cppwrf_overlay.sh` |
 
 ## Limits
 

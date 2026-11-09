@@ -1,6 +1,6 @@
 # WEB1 report
 
-Milestone WEB1: WRF-ARW runs in a web browser through WebAssembly, in FP64, and its wrfout is bit-identical to
+Milestone WEB1: CPPWRF runs in a web browser through WebAssembly, in FP64, and its wrfout is bit-identical to
 the native CPU FP64 build of CPPWRF, which is bit-identical to WRF v4.8.0 real*8.
 
 ## What works

@@ -1,7 +1,7 @@
 # CPPWRF-Web
 
-WRF-ARW v4.8.0 in a web browser. The page runs [CPPWRF](https://github.com/Xassemblianist/CPPWRF), the C++20 port
-of WRF, compiled to WebAssembly in double precision. Two of WRF's idealized cases run in it:
+[CPPWRF](https://github.com/Xassemblianist/CPPWRF) in a web browser: our C++20 atmospheric model, compiled to
+WebAssembly in double precision. Two of WRF's idealized cases run in it:
 
 - `em_squall2d_x`, the 2-D squall line;
 - `em_quarter_ss`, the 3-D supercell.

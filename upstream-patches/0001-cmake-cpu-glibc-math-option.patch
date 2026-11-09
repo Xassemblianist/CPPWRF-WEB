@@ -1,0 +1,44 @@
+diff -ru a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -60,6 +60,20 @@
+     add_compile_definitions(CPPWRF_CUDA_LIBM)
+   endif()
+ endif()
++# CPU FP64 builds on a C library other than glibc (macOS, musl, WebAssembly): its libm gives other bits than WRF's
++# gfortran build on glibc; ON: CPPWRF's port of glibc's libm and libmvec (src/core/glibc_math.hpp), as the CUDA
++# FP64 build. Default ON where the C library is not glibc on x86-64.
++include(CheckSymbolExists)
++check_symbol_exists(__GLIBC__ "features.h" CPPWRF_HAVE_GLIBC)
++if(CPPWRF_HAVE_GLIBC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
++  set(_glibc_math_default OFF)
++else()
++  set(_glibc_math_default ON)
++endif()
++option(CPPWRF_CPU_GLIBC_MATH "CPU FP64 build: CPPWRF's port of glibc's math (for other C libraries)" ${_glibc_math_default})
++if(CPPWRF_CPU_GLIBC_MATH AND CPPWRF_DOUBLE AND NOT CPPWRF_ENABLE_CUDA)
++  add_compile_definitions(CPPWRF_GLIBC_MATH=1)
++endif()
+ # flags that change results: reassociation, reciprocals, flush-to-zero, approximate division / sqrt
+ string(TOUPPER "${CMAKE_BUILD_TYPE}" _cppwrf_bt)
+ if("${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${_cppwrf_bt}}" MATCHES
+@@ -165,7 +179,7 @@
+              CPPWRF_COMMIT="${CPPWRF_COMMIT}")
+ target_link_libraries(cppwrf_core PUBLIC cppwrf_io)
+ # glibc libmvec: Grell-Freitas-Li uses the 2-lane vector pow where WRF's gfortran build vectorises (cu_gfl)
+-if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
++if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64" AND NOT (CPPWRF_CPU_GLIBC_MATH AND CPPWRF_DOUBLE))
+   target_link_libraries(cppwrf_core PUBLIC mvec)
+ endif()
+ if(EXISTS ${CMAKE_SOURCE_DIR}/src/dyn/small_step.cpp)
+diff -ru a/src/core/backend.hpp b/src/core/backend.hpp
+--- a/src/core/backend.hpp
++++ b/src/core/backend.hpp
+@@ -34,6 +34,7 @@
+ // CUDA FP64 build: glibc's libm and libmvec algorithms on the device and the host (core/glibc_math.hpp), the
+ // results of WRF's real*8 build and of the CPU build; CMake option CPPWRF_CUDA_GLIBC_MATH (default ON; OFF:
+ // CPPWRF_CUDA_LIBM, CUDA's math library). The kernels call the math library as cppwrf::libm (core/libm.hpp).
++// CPU FP64 builds on another C library (CMake option CPPWRF_CPU_GLIBC_MATH) define CPPWRF_GLIBC_MATH themselves.
+ #if defined(CPPWRF_USE_CUDA) && defined(CPPWRF_DOUBLE) && !defined(CPPWRF_CUDA_LIBM)
+ #define CPPWRF_GLIBC_MATH 1
+ #endif

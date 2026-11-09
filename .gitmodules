@@ -1,0 +1,3 @@
+[submodule "third_party/CPPWRF"]
+	path = third_party/CPPWRF
+	url = https://github.com/Xassemblianist/CPPWRF.git

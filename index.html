@@ -1,0 +1,128 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CPPWRF-Web</title>
+<meta name="description" content="WRF-ARW v4.8.0 (CPPWRF) running in the browser through WebAssembly, bit-identical to WRF real*8.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231e5aa8'/%3E%3Cpath d='M7 21c3-7 6-11 9-11s5 4 9 2' stroke='white' stroke-width='2.6' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+</head>
+<body>
+<div class="topbar">
+  <div class="wrap topbar-inner">
+    <a class="brand" href="./">
+      <svg viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7"/><path d="M7 21c3-7 6-11 9-11s5 4 9 2"/></svg>
+      CPPWRF-Web
+    </a>
+    <nav>
+      <a href="https://github.com/Xassemblianist/CPPWRF-WEB">Source</a>
+      <a href="https://github.com/Xassemblianist/CPPWRF">CPPWRF</a>
+      <button id="theme" type="button" class="icon-btn" aria-label="Switch colour theme" title="Switch colour theme">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z"/></svg>
+      </button>
+    </nav>
+  </div>
+</div>
+
+<main class="wrap">
+  <header class="hero">
+    <p class="eyebrow">WRF-ARW v4.8.0 · WebAssembly · double precision</p>
+    <h1>A thunderstorm, computed in your browser.<br><span>Bit for bit what WRF computes.</span></h1>
+    <p class="lede"><a href="https://github.com/Xassemblianist/CPPWRF">CPPWRF</a>, the C++ port of the WRF model,
+      compiled to WebAssembly and run in this tab, in double precision. When the hour of model time is done, the
+      page hashes every value of the <code>wrfout</code> file it wrote and compares it with the native CPU build of
+      CPPWRF, which is bit-identical to WRF real*8.</p>
+  </header>
+
+  <section class="card run" aria-label="Run">
+    <div class="case-row">
+      <div class="segmented" role="group" aria-label="Case">
+        <button type="button" data-case="em_squall2d_x" aria-pressed="true"><b>Squall line</b><span>2-D · em_squall2d_x</span></button>
+        <button type="button" data-case="em_quarter_ss" aria-pressed="false"><b>Supercell</b><span>3-D · em_quarter_ss</span></button>
+      </div>
+      <p class="case-about" id="case-about"></p>
+    </div>
+    <ul class="chips" id="chips" aria-label="Case set-up"></ul>
+    <div class="run-row">
+      <button id="run" type="button" class="primary">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
+        <span>Run the model</span>
+      </button>
+      <div class="progress">
+        <div class="progress-top">
+          <span id="status">Ready</span>
+          <span id="pct" class="mono"></span>
+        </div>
+        <div class="bar"><div id="bar-fill"></div></div>
+      </div>
+    </div>
+    <dl class="live" id="live">
+      <div><dt>Step</dt><dd class="mono" id="l-step">–</dd></div>
+      <div><dt>Model time</dt><dd class="mono" id="l-time">–</dd></div>
+      <div><dt>Speed</dt><dd class="mono" id="l-speed">–</dd></div>
+      <div><dt>Elapsed</dt><dd class="mono" id="l-el">–</dd></div>
+    </dl>
+  </section>
+
+  <section class="card viewer" aria-label="Fields">
+    <div class="viewer-head">
+      <h2>x–z cross sections</h2>
+      <p class="sub">Along x, 0–16 km in height (interpolated from the model's η levels), in <span id="where"></span></p>
+    </div>
+    <div id="panels"></div>
+    <div class="timeline">
+      <button id="play" type="button" class="icon-btn" aria-label="Play" disabled>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path id="play-icon" d="M8 5v14l11-7z"/></svg>
+      </button>
+      <input id="scrub" type="range" min="0" max="0" value="0" step="1" disabled aria-label="Model time">
+      <span id="scrub-label" class="mono">00:00</span>
+    </div>
+  </section>
+
+  <section class="card verify" id="verify" aria-label="Check" hidden>
+    <div class="verify-head">
+      <div class="seal" id="seal" aria-hidden="true">
+        <svg viewBox="0 0 24 24"><path id="seal-icon" d="M5 12.5l4.5 4.5L19 7.5"/></svg>
+      </div>
+      <div>
+        <h2 id="verdict"></h2>
+        <p class="sub" id="verdict-sub"></p>
+      </div>
+    </div>
+    <div class="vargrid" id="vargrid" role="list" aria-label="Variables"></div>
+    <p class="legend"><span class="sw ok"></span>every output time equal <span class="sw bad"></span>a time differs
+      · hover a cell for the variable</p>
+    <div class="tiles" id="tiles"></div>
+    <div class="verify-foot">
+      <a id="download" class="primary" download>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11m0 0l-4.5-4.5M12 15l4.5-4.5M5 19h14"/></svg>
+        <span>Download wrfout</span>
+      </a>
+      <details>
+        <summary>How the check works</summary>
+        <p>For each of the file's variables and each of its output times, the page takes the SHA-256 of the values as
+          stored in the NetCDF file and compares it with <code>expected/&lt;case&gt;.json</code>.
+          That file was written once from the native build: <span id="label"></span>. The whole file is compared as
+          well; the wasm build writes it with the same CPPWRF writer and the same NetCDF-C version.</p>
+        <p>Bit identity in the browser rests on three things: no fused multiply-add contraction and no fast-math in
+          the wasm, CPPWRF's own port of glibc's libm and libmvec instead of Emscripten's math library, and the same
+          order of operations as WRF, statement by statement.</p>
+      </details>
+    </div>
+  </section>
+
+  <footer>
+    <p>CPPWRF-Web and CPPWRF are free software under the GNU GPL v3 or later (<a href="LICENSE">licence</a>,
+      <a href="NOTICE.md">notices</a>). WRF was developed at the National Center for Atmospheric Research (NCAR),
+      which is operated by the University Corporation for Atmospheric Research (UCAR). WRF® is a registered
+      trademark of UCAR. CPPWRF is an independent port and is not affiliated with or endorsed by NCAR or UCAR.</p>
+  </footer>
+</main>
+<script type="module" src="app.js"></script>
+</body>
+</html>

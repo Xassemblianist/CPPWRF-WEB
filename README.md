@@ -97,7 +97,7 @@ from the native build with `tools/nc_hashes.py`. The page computes the same hash
 | `tests/` | the math check (`math_bits.cpp`) and the headless node run (`run_node.mjs`) |
 | `tools/` | the builds of NetCDF-C and of the site, and the hash tool (`nc_hashes.py`) |
 | `forecast/` | the local forecast: the pipeline, the server and post-processor (`server/`), the map page (`web/`) |
-| `upstream-patches/` | changes to CPPWRF; the ones in `REQUIRED` are applied to a copy by `tools/cppwrf_overlay.sh` |
+| `upstream-patches/` | suggested changes to CPPWRF (none is needed) |
 
 ## Limits
 

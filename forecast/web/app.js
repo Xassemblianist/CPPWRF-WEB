@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // CPPWRF Forecast: the map page. Talks to the local server (forecast/server/server.cpp) only.
-//   - a Web Mercator map drawn from WPS's geography (the server's /api/basemap): water, relief, coastlines
+//   - a Web Mercator map drawn from WPS's geography (the server's /api/v1/basemap): water, relief, coastlines
 //   - the chosen run's fields (wrfpost products on a latitude-longitude grid) as a colour layer, wind particles,
 //     isobars, a time bar and a value probe
 //   - the new-forecast form (domain on the map, checks by the server) and the progress of the running forecast
@@ -408,16 +408,16 @@ $("play").addEventListener("click", () => {
 $("time").addEventListener("input", (e) => setTime(+e.target.value));
 
 async function loadRun(id) {
-  const meta = await (await fetch(`/api/runs/${id}/meta.json`)).json();
+  const meta = await (await fetch(`/api/v1/runs/${id}/products/meta.json`)).json();
   const frames = await Promise.all(meta.times.map((_, k) =>
-    fetch(`/api/runs/${id}/frame_${String(k).padStart(3, "0")}.bin`).then((r) => r.arrayBuffer()).then((b) => new Float32Array(b))));
+    fetch(`/api/v1/runs/${id}/products/frame_${String(k).padStart(3, "0")}.bin`).then((r) => r.arrayBuffer()).then((b) => new Float32Array(b))));
   state.run = id; state.meta = meta; state.frames = frames; state.t = 0;
   $("timebar").hidden = false;
   $("time").max = String(meta.times.length - 1);
   const step = Math.max(1, Math.ceil(meta.times.length / 8));
   $("time-ticks").innerHTML = meta.times.map((t, k) => k % step ? "" :
     `<span style="left:${(100 * k) / Math.max(1, meta.times.length - 1)}%">${new Date(t).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}</span>`).join("");
-  $("dl").href = `/api/runs/${id}/wrfout`;
+  fetch(`/api/v1/runs/${id}/files`).then((r) => r.json()).then((f) => { if (f[0]) $("dl").href = `/api/v1/runs/${id}/out/${f[0].path}`; });
   const lat = meta.lat0 + meta.dlat * meta.nlat / 2, lon = meta.lon0 + meta.dlon * meta.nlon / 2;
   centreOn(lat, lon, meta.dlon * meta.nlon * 111.2 * Math.cos(lat * DEG) * 1.7);
   legend();
@@ -439,18 +439,23 @@ function formChanged() {
   estTimer = setTimeout(estimate, 250);
 }
 function body() {
-  return JSON.stringify({ lat: state.pick.lat, lon: state.pick.lon, dx_km: +$("dx").value, nx: +$("nx").value,
-    ny: +$("ny").value, nz: +$("nz").value, hours: +$("hours").value, backend: state.backend, suite: state.suite });
+  return JSON.stringify({
+    domain: { lat: state.pick.lat, lon: state.pick.lon, dx_km: +$("dx").value, nx: +$("nx").value, ny: +$("ny").value, nz: +$("nz").value },
+    time: { cycle: "latest", hours: +$("hours").value }, mode: state.backend,
+    physics: { preset: state.suite === "CONUS" ? "conus" : "tropical" } });
 }
 async function estimate() {
   if (!state.pick) { $("start").disabled = true; return; }
-  const r = await (await fetch("/api/estimate", { method: "POST", body: body() })).json();
-  out("e-gpu", state.backend === "gpu-fp32" ? `${r.gpu_gb.toFixed(1)} GB` : "CPU");
-  out("e-disk", `${r.disk_gb.toFixed(2)} GB`);
+  const r = await (await fetch("/api/v1/estimate", { method: "POST", body: body() })).json();
+  const e = r.estimate;
+  out("e-gpu", e ? (state.backend.startsWith("gpu") ? `${(e.gpu_mib / 1024).toFixed(1)} GB` : "CPU") : "–");
+  out("e-disk", e ? `${(e.disk_peak_bytes / 1e9).toFixed(2)} GB` : "–");
   const msg = $("est-msg");
-  msg.hidden = r.ok;
-  msg.className = "msg";
-  msg.textContent = r.ok ? "" : r.error + (r.suggestion ? `\n→ ${r.suggestion}` : "");
+  const lines = [...(r.errors || []), ...(r.warnings || [])].map((x) => x.message);
+  if (r.fix) lines.push(`→ ${r.fix}`);
+  msg.hidden = !lines.length;
+  msg.className = r.ok ? "msg info" : "msg";
+  msg.textContent = lines.join("\n");
   $("start").disabled = !r.ok || !!runningJob;
 }
 ["dx", "nx", "ny", "nz", "hours"].forEach((id) => $(id).addEventListener("input", formChanged));
@@ -466,12 +471,12 @@ document.querySelectorAll("[data-suite]").forEach((b) => b.addEventListener("cli
 }));
 $("start").addEventListener("click", async () => {
   $("start").disabled = true;
-  const r = await fetch("/api/runs", { method: "POST", body: body() });
+  const r = await fetch("/api/v1/runs", { method: "POST", body: body() });
   const j = await r.json();
   if (!r.ok) {
     const msg = $("est-msg");
     msg.hidden = false; msg.className = "msg";
-    msg.textContent = j.error + (j.suggestion ? `\n→ ${j.suggestion}` : "");
+    msg.textContent = (j.errors || []).concat(j.warnings || []).map((x) => x.message).join("\n") + (j.fix ? `\n→ ${j.fix}` : "");
     $("start").disabled = false;
     return;
   }
@@ -490,11 +495,10 @@ document.querySelectorAll("[data-tab]").forEach((b) => b.addEventListener("click
 // ---- the running forecast
 const STAGES = [["download", "GFS"], ["wps", "WPS"], ["real", "real"], ["model", "Model"], ["post", "Map"]];
 let runningJob = null, pollTimer = null;
-function parseState(s) {
-  const p = s.split(" ");
-  if (p[0] === "done") return { done: true };
-  if (p[0] === "failed") return { failed: true, stage: p[1], text: p.slice(2).join(" ") };
-  return { stage: p[1], pct: +p[2] || 0 };
+function parseState(r) {
+  if (r.status === "done") return { done: true };
+  if (r.status === "failed" || r.status === "cancelled") return { failed: true, stage: r.stage, text: r.message || r.status };
+  return { stage: r.stage, pct: +r.pct || 0 };
 }
 function watch(id) {
   runningJob = id;
@@ -505,9 +509,9 @@ function watch(id) {
   poll(id);
 }
 async function poll(id) {
-  const r = await fetch(`/api/runs/${id}`);
+  const r = await fetch(`/api/v1/runs/${id}`);
   if (!r.ok) return;
-  const j = await r.json(), st = parseState(j.state), p = j.params;
+  const j = await r.json(), st = parseState(j), p = { ...j.settings.domain, ...j.settings.time, backend: j.settings.mode };
   $("job-title").textContent = st.done ? "Forecast ready" : st.failed ? "Forecast stopped" : "Forecast running";
   $("job-sub").textContent = `${p.nx}×${p.ny}×${p.nz} · ${p.dx_km} km · ${p.hours} h · ${p.backend} · GFS ${p.cycle.slice(0, 8)} ${p.cycle.slice(8)}Z`;
   const k = st.done ? STAGES.length : Math.max(0, STAGES.findIndex(([s]) => s === st.stage));
@@ -516,12 +520,11 @@ async function poll(id) {
     const w = i === k && !st.failed && !st.done ? st.pct : 0;
     return `<li class="${cls}">${label}<div class="bar"><i style="width:${cls === "done" || cls === "fail" ? 100 : w}%"></i></div></li>`;
   }).join("");
-  $("job-log").textContent = j.log || "";
+  if (st.stage) fetch(`/api/v1/runs/${id}/logs/${st.stage === "wps" ? "metgrid" : st.stage}`).then((x) => x.ok ? x.text() : "").then((t) => { $("job-log").textContent = t.slice(-3000); });
   const msg = $("job-msg");
   if (st.failed) {
     msg.hidden = false;
-    const tr = (j.translator || "").trim().split("\n"), errs = tr.filter((l) => l.includes("[ERROR]"));
-    msg.textContent = st.text + (tr[0] ? `\n\nTranslator:\n${(errs.length ? errs : tr.slice(-8)).join("\n")}` : "");
+    msg.textContent = st.text;
   } else msg.hidden = true;
   $("cancel").textContent = st.done || st.failed ? "Close" : "Cancel";
   if (st.done || st.failed) {
@@ -533,18 +536,18 @@ async function poll(id) {
   }
 }
 $("cancel").addEventListener("click", async () => {
-  if (runningJob) await fetch(`/api/runs/${runningJob}/cancel`, { method: "POST" });
+  if (runningJob) await fetch(`/api/v1/runs/${runningJob}/cancel`, { method: "POST" });
   else $("job").hidden = true;
 });
 
 // ---- runs list and the system line
 async function refreshRuns() {
-  const runs = await (await fetch("/api/runs")).json();
+  const runs = await (await fetch("/api/v1/runs")).json();
   $("runs-count").textContent = runs.length ? `(${runs.length})` : "";
   $("runs").innerHTML = runs.length ? runs.map((r) => {
-    const st = parseState(r.state), p = r.params;
+    const st = parseState(r), p = { ...r.settings.domain, ...r.settings.time, backend: r.settings.mode };
     const badge = st.done ? '<span class="badge ok">ready</span>' : st.failed ? '<span class="badge bad">failed</span>' : '<span class="badge run">running</span>';
-    return `<div class="run${r.id === state.run ? " active" : ""}" data-id="${r.id}" data-ready="${r.products}">
+    return `<div class="run${r.id === state.run ? " active" : ""}" data-id="${r.id}" data-ready="${r.status === "done"}">
       <b>${p.lat.toFixed(1)}°, ${p.lon.toFixed(1)}° · ${p.hours} h</b>${badge}
       <span class="meta">${r.id} · ${p.nx}×${p.ny} · ${p.dx_km} km · ${p.backend}</span>
       ${st.done || st.failed ? '<button class="del" type="button">delete</button>' : ""}</div>`;
@@ -556,19 +559,20 @@ async function refreshRuns() {
       else watch(el.dataset.id);
     });
     el.querySelector(".del")?.addEventListener("click", async () => {
-      await fetch(`/api/runs/${el.dataset.id}/delete`, { method: "POST" });
+      await fetch(`/api/v1/runs/${el.dataset.id}`, { method: "DELETE" });
       if (state.run === el.dataset.id) { state.meta = null; state.frames = []; $("timebar").hidden = true; legend(); drawBase(); }
       refreshRuns();
     });
   });
-  const live = runs.find((r) => r.state.startsWith("running"));
+  const live = runs.find((r) => !["done", "failed", "cancelled"].includes(r.status));
   if (live && runningJob !== live.id) watch(live.id);
 }
 async function info() {
   try {
-    const j = await (await fetch("/api/info")).json();
-    $("sys").textContent = `${j.gpu.ok ? j.gpu.name.replace("NVIDIA GeForce ", "") + " · " + (j.gpu.free_mib / 1024).toFixed(1) + " GB free" : "no GPU"} · disk ${j.disk_free_gb} GB free`;
-    out("e-cycle", j.cycle ? `${j.cycle.slice(0, 4)}-${j.cycle.slice(4, 6)}-${j.cycle.slice(6, 8)} ${j.cycle.slice(8)}Z` : "unavailable");
+    const j = await (await fetch("/api/v1/system")).json();
+    $("sys").textContent = `${j.gpu.ok ? j.gpu.name.replace("NVIDIA GeForce ", "") + " · " + (j.gpu.free_mib / 1024).toFixed(1) + " GB free" : "no GPU"} · disk ${j.disk_free_gb.toFixed(1)} GB free · CPPWRF ${j.cppwrf_commit}`;
+    const c = (await (await fetch("/api/v1/cycles")).json()).latest;
+    out("e-cycle", c ? `${c.slice(0, 4)}-${c.slice(4, 6)}-${c.slice(6, 8)} ${c.slice(8)}Z` : "unavailable");
   } catch { $("sys").textContent = "server not reachable"; }
 }
 
@@ -585,7 +589,7 @@ async function info() {
   info();
   setInterval(info, 15000);
   refreshRuns();
-  const buf = await (await fetch("/api/basemap")).arrayBuffer();
+  const buf = await (await fetch("/api/v1/basemap")).arrayBuffer();
   BASE = { water: new Uint8Array(buf, 0, BW * BH), height: new Uint8Array(buf, BW * BH, BW * BH) };
   // hillshade, lit from the north-west, once per cell (rows run south to north); interpolated when drawn
   const H = BASE.height, shade = new Int8Array(BW * BH);

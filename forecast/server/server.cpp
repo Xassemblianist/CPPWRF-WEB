@@ -1,24 +1,33 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// cppwrf-forecast: the local forecast server. Serves the map page (forecast/web) and a small JSON API on 127.0.0.1
-// only, and runs one forecast at a time with forecast/pipeline.sh (GFS -> WPS -> cppwrf_real -> cppwrf -> wrfpost).
+// cppwrf-forecast: the local forecast server. Serves the site (forecast/web) and a JSON API on 127.0.0.1 only,
+// keeps a queue of forecasts and runs one at a time with forecast/pipeline.sh
+// (GFS -> WPS -> cppwrf_real -> cppwrf -> wrfpost).
 //
 //   cppwrf-forecast [--port 8090]      (from the repository root, or with CPPWRF_WEB_ROOT set)
 //
-// API
-//   GET  /api/info                 GPU, disk, limits, the latest GFS cycle
-//   GET  /api/basemap              the world map at 5': uint8 water percent [2160][4320], then uint8 height / 25 m
-//                                  [2160][4320] (south row first, x from 180 deg west)
-//   GET  /api/runs                 the runs, newest first
-//   POST /api/runs                 start a run: {lat, lon, dx_km, nx, ny, nz, hours, backend, suite}
-//   POST /api/estimate             the same checks without starting
-//   GET  /api/runs/<id>            one run: parameters, state, the end of its log
-//   POST /api/runs/<id>/cancel     stop it
-//   POST /api/runs/<id>/delete     remove its directory
-//   GET  /api/runs/<id>/meta.json, static.bin, frame_NNN.bin, wrfout
+// API (JSON), /api/v1:
+//   GET    /system                    GPU (name, memory, compute capability), RAM, disk, the builds, CPPWRF commit
+//   GET    /options                   presets and CPPWRF's supported options (from the submodule's translator)
+//   GET    /cycles                    GFS cycles: the latest complete one and the earlier ones NOMADS keeps
+//   GET    /basemap                   the world map (WPS geography): water percent and height / 25 m at 5'
+//   POST   /estimate                  settings -> checks, time per stage, memory, disk, GFS size, warning level
+//   POST   /runs                      start (queue) a run; refused when the estimate is red
+//   GET    /runs, /runs/<id>          the run library, one run (run.json)
+//   DELETE /runs/<id>                 delete a run (and its files)
+//   POST   /runs/<id>/cancel          SIGTERM to the run's process group, SIGKILL after 10 s
+//   POST   /runs/<id>/star            {"starred": true|false}: starred runs are never deleted automatically
+//   GET    /runs/<id>/events          Server-Sent Events: stage, simulated time, step rate, remaining time, log tail
+//   GET    /runs/<id>/logs/<stage>    one stage's log
+//   GET    /runs/<id>/products/<file> the map products (wrfpost)
+//   GET    /runs/<id>/out/[d0N/]<file> the wrfout files
 //
-// Limits (checked before every run): at most 150 x 150 x 45 points and 24 h; the GPU memory estimate below the free
-// memory; at least 15 GB free on the disk and the repository below 8 GB after the run (old runs are deleted first).
+// Security: requests are at most 64 KB; bodies are parsed as JSON and checked by forecast/prepare.py against the
+// settings schema; programs are started with execvp and argument arrays (never a shell); every file path is built
+// from a checked run id and a checked file name; only forecast/web and build/runs are served. Pages served from the
+// GitHub Pages origin (CPPWRF_ALLOWED_ORIGINS) may call the API (CORS, Private Network Access); other origins may not
+// change anything.
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <sys/socket.h>
@@ -30,113 +39,225 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <deque>
 #include <filesystem>
 #include <fstream>
-#include <map>
 #include <mutex>
-#include <optional>
+#include <random>
+#include <regex>
 #include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "json.hpp"
+
 namespace fs = std::filesystem;
+using json::Value;
 
 namespace {
 
-// ---- limits and the measured costs (RTX 2060, CPPWRF FP32: 1.83 GB at 105 k cells, 3.32 GB at 480 k cells)
-constexpr int kMaxXY = 150, kMaxZ = 45, kMinXY = 20, kMinZ = 25, kMaxHours = 24;
-constexpr double kGpuFixedMiB = 1430, kGpuMiBPerCell = 0.0040, kGpuMargin = 1.10;
-constexpr double kMinFreeGB = 15, kMaxRepoGB = 8;
-constexpr double kOutBytesPerCellFrame = 45, kInBytesPerCell = 400;
-constexpr int kKeepRuns = 6;
+constexpr double kMinFreeGB = 15;
+constexpr size_t kMaxRequest = 64 * 1024;
 
 fs::path g_root;
-std::mutex g_mu;
-pid_t g_child = -1;
+int g_port = 8090;
+int g_keep_runs = 12;
+std::vector<std::string> g_origins = {"https://xassemblianist.github.io"};  // CPPWRF_ALLOWED_ORIGINS
+thread_local std::string t_cors;  // the CORS headers of the request being answered
+std::mutex g_mu;                 // the queue, the child and every run.json write
+std::condition_variable g_cv;
+std::deque<std::string> g_queue;
+pid_t g_child = -1;              // the running pipeline (its process group id)
 std::string g_child_id;
 
 // ---- small helpers
-std::string run_cmd(const std::string& cmd) {
-  std::string out;
-  if (FILE* p = popen(cmd.c_str(), "r")) {
-    char buf[4096];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof buf, p)) > 0) out.append(buf, n);
-    pclose(p);
-  }
-  return out;
-}
-std::string trim(std::string s) {
-  while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ')) s.pop_back();
-  return s;
-}
 std::string read_file(const fs::path& p) {
   std::ifstream f(p, std::ios::binary);
   return std::string(std::istreambuf_iterator<char>(f), {});
 }
-std::string esc(const std::string& s) {
-  std::string r;
-  for (char c : s) {
-    if (c == '"' || c == '\\') r += '\\', r += c;
-    else if (c == '\n') r += "\\n";
-    else if (static_cast<unsigned char>(c) < 0x20) r += ' ';
-    else r += c;
-  }
-  return r;
+void write_atomic(const fs::path& p, const std::string& s) {
+  const fs::path tmp = p.string() + ".tmp";
+  { std::ofstream(tmp, std::ios::binary) << s; }
+  std::error_code ec;
+  fs::rename(tmp, p, ec);
 }
-std::string num(double v, int prec = 2) {
-  char b[64];
-  std::snprintf(b, sizeof b, "%.*f", prec, v);
+std::string trim(std::string s) {
+  while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
+  size_t i = 0;
+  while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) ++i;
+  return s.substr(i);
+}
+std::string now_iso() {
+  char b[32];
+  const std::time_t t = std::time(nullptr);
+  std::tm u{};
+  gmtime_r(&t, &u);
+  std::strftime(b, sizeof b, "%Y-%m-%dT%H:%M:%SZ", &u);
   return b;
 }
-double disk_free_gb(const fs::path& p) {
-  struct statvfs s;
-  if (statvfs(p.c_str(), &s) != 0) return 0;
-  return double(s.f_bavail) * s.f_frsize / 1e9;
-}
-double repo_gb() {
-  return std::atof(run_cmd("du -sb '" + g_root.string() + "' 2>/dev/null | cut -f1").c_str()) / 1e9;
-}
-struct Gpu { bool ok = false; std::string name; double total = 0, free = 0; };
-Gpu gpu() {
-  Gpu g;
-  const std::string s = run_cmd("nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv,noheader,nounits 2>/dev/null");
-  const auto a = s.find(','), b = s.find(',', a + 1);
-  if (a == std::string::npos || b == std::string::npos) return g;
-  g.ok = true;
-  g.name = trim(s.substr(0, a));
-  g.total = std::atof(s.c_str() + a + 1);
-  g.free = std::atof(s.c_str() + b + 1);
-  return g;
+fs::path runs_dir() { return g_root / "build/runs"; }
+
+// a program with an argument array, its standard output captured (stderr to /dev/null), no shell
+struct Proc { int status = -1; std::string out; };
+Proc run_prog(const std::vector<std::string>& argv, const fs::path& cwd = {}, int timeout_s = 120) {
+  Proc r;
+  int fds[2];
+  if (pipe(fds) != 0) return r;
+  const pid_t pid = fork();
+  if (pid == 0) {
+    dup2(fds[1], 1);
+    const int dn = open("/dev/null", O_WRONLY);
+    if (dn >= 0) dup2(dn, 2);
+    close(fds[0]);
+    close(fds[1]);
+    if (!cwd.empty() && chdir(cwd.c_str()) != 0) _exit(127);
+    std::vector<char*> a;
+    for (const auto& s : argv) a.push_back(const_cast<char*>(s.c_str()));
+    a.push_back(nullptr);
+    execvp(a[0], a.data());
+    _exit(127);
+  }
+  close(fds[1]);
+  if (pid < 0) { close(fds[0]); return r; }
+  const auto t0 = std::chrono::steady_clock::now();
+  char buf[8192];
+  fcntl(fds[0], F_SETFL, O_NONBLOCK);
+  while (true) {
+    const ssize_t n = read(fds[0], buf, sizeof buf);
+    if (n > 0) { r.out.append(buf, size_t(n)); continue; }
+    if (n == 0) break;
+    if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(timeout_s)) { kill(pid, SIGKILL); break; }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  close(fds[0]);
+  int st = 0;
+  waitpid(pid, &st, 0);
+  r.status = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+  return r;
 }
 
-// the flat JSON object of a request body: numbers and strings
-std::map<std::string, std::string> parse_flat(const std::string& s) {
-  std::map<std::string, std::string> m;
-  size_t i = 0;
-  auto skip = [&] { while (i < s.size() && std::strchr(" \t\r\n,{}:", s[i])) ++i; };
-  auto str = [&] {
-    std::string r;
-    ++i;
-    while (i < s.size() && s[i] != '"') { if (s[i] == '\\' && i + 1 < s.size()) ++i; r += s[i++]; }
-    ++i;
-    return r;
-  };
-  while (true) {
-    skip();
-    if (i >= s.size() || s[i] != '"') break;
-    const std::string k = str();
-    skip();
-    if (i < s.size() && s[i] == '"') m[k] = str();
-    else { size_t j = i; while (j < s.size() && !std::strchr(",}", s[j])) ++j; m[k] = trim(s.substr(i, j - i)); i = j; }
+double disk_free_gb() {
+  struct statvfs s;
+  if (statvfs(g_root.c_str(), &s) != 0) return 0;
+  return double(s.f_bavail) * s.f_frsize / 1e9;
+}
+uint64_t dir_bytes(const fs::path& p) {
+  uint64_t n = 0;
+  std::error_code ec;
+  for (auto it = fs::recursive_directory_iterator(p, fs::directory_options::skip_permission_denied, ec);
+       it != fs::recursive_directory_iterator(); it.increment(ec))
+    if (!ec && !it->is_symlink(ec) && it->is_regular_file(ec)) n += it->file_size(ec);
+  return n;
+}
+double meminfo_mib(const char* key) {
+  std::ifstream f("/proc/meminfo");
+  for (std::string line; std::getline(f, line);)
+    if (line.rfind(key, 0) == 0) return std::atof(line.c_str() + std::strlen(key)) / 1024.0;
+  return 0;
+}
+
+std::string cppwrf_commit() {
+  static const std::string c =
+      trim(run_prog({"git", "-C", (g_root / "third_party/CPPWRF").string(), "rev-parse", "--short=7", "HEAD"}).out);
+  return c;
+}
+
+Value system_info() {
+  Value s = Value::object();
+  const Proc g = run_prog({"nvidia-smi", "--query-gpu=name,memory.total,memory.free,compute_cap", "--format=csv,noheader,nounits"});
+  Value gpu = Value::object();
+  gpu["ok"] = false;
+  if (g.status == 0) {
+    std::vector<std::string> f;
+    std::stringstream ss(g.out.substr(0, g.out.find('\n')));
+    for (std::string x; std::getline(ss, x, ',');) f.push_back(trim(x));
+    if (f.size() == 4) {
+      gpu["ok"] = true;
+      gpu["name"] = f[0];
+      gpu["total_mib"] = std::atof(f[1].c_str());
+      gpu["free_mib"] = std::atof(f[2].c_str());
+      gpu["compute_cap"] = f[3];
+    }
   }
-  return m;
+  s["gpu"] = gpu;
+  s["ram_total_mib"] = meminfo_mib("MemTotal:");
+  s["ram_available_mib"] = meminfo_mib("MemAvailable:");
+  s["cpus"] = int(std::thread::hardware_concurrency());
+  s["disk_free_gb"] = disk_free_gb();
+  s["disk_floor_gb"] = kMinFreeGB;
+  s["runs_gb"] = double(dir_bytes(runs_dir())) / 1e9;
+  Value builds = Value::object();
+  for (const char* b : {"gpu-fp32", "gpu-fp64", "cpu-fp64"}) {
+    const fs::path d = g_root / "build" / b;
+    Value x = Value::object();
+    x["present"] = fs::exists(d / "cppwrf");
+    x["commit"] = trim(read_file(d / ".commit"));
+    builds[b] = x;
+  }
+  builds["cppwrf_real"] = fs::exists(g_root / "build/cpu-fp64/src/init_real/cppwrf_real");
+  s["builds"] = builds;
+  s["cppwrf_commit"] = cppwrf_commit();
+  {
+    std::lock_guard<std::mutex> lk(g_mu);
+    s["busy"] = g_child > 0;
+    s["queued"] = int(g_queue.size());
+  }
+  return s;
+}
+// the numbers prepare.py needs to judge a run
+std::string system_for_prepare(const Value& s) {
+  Value p = Value::object();
+  p["gpu_ok"] = s["gpu"]["ok"];
+  p["gpu_free_mib"] = s["gpu"]["free_mib"].num();
+  p["gpu_total_mib"] = s["gpu"]["total_mib"].num();
+  p["ram_available_mib"] = s["ram_available_mib"].num();
+  p["disk_free_gb"] = s["disk_free_gb"].num();
+  return json::dump(p);
+}
+
+// ---- GFS cycles: the newest whose last forecast hour (f384) is on NOMADS, and the earlier ones NOMADS keeps
+Value cycles() {
+  static std::mutex mu;
+  static Value cached;
+  static std::time_t when = 0;
+  std::lock_guard<std::mutex> lk(mu);
+  const std::time_t now = std::time(nullptr);
+  if (!cached.is_null() && !cached["latest"].str().empty() && now - when < 600) return cached;
+  auto name = [](std::time_t t) {
+    std::tm u{};
+    gmtime_r(&t, &u);
+    u.tm_hour -= u.tm_hour % 6;
+    char b[16];
+    std::strftime(b, sizeof b, "%Y%m%d%H", &u);
+    return std::string(b);
+  };
+  std::string latest;
+  for (int back = 3; back <= 36 && latest.empty(); back += 6) {
+    const std::string c = name(now - back * 3600);
+    const std::string url = "https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/gfs." + c.substr(0, 8) + "/" +
+                            c.substr(8) + "/atmos/gfs.t" + c.substr(8) + "z.pgrb2.0p25.f384.idx";
+    const Proc p = run_prog({"curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "15", url}, {}, 20);
+    if (trim(p.out) == "200") latest = c;
+  }
+  Value v = Value::object();
+  v["latest"] = latest;
+  Value list = Value::array();
+  if (!latest.empty()) {
+    std::tm u{};
+    strptime(latest.c_str(), "%Y%m%d%H", &u);
+    const std::time_t t0 = timegm(&u);
+    for (int k = 0; k < 4 * 8; ++k) list.push(name(t0 - k * 6 * 3600));  // NOMADS keeps about ten days
+  }
+  v["cycles"] = list;
+  cached = v;
+  when = now;
+  return v;
 }
 
 // ---- the world map from WPS's low-resolution geography (GMTED2010 5' height, MODIS 5' water fraction)
@@ -167,7 +288,6 @@ std::string build_basemap() {
           water[size_t(ty * T + y) * NX + (tx * T + x)] = static_cast<unsigned char>(std::min(100, w));
         }
     }
-  // two planes at 5', x from 180 deg west, south row first: water percent, height / 25 m
   std::string out(2u * NX * NY, '\0');
   for (int y = 0; y < NY; ++y)
     for (int x = 0; x < NX; ++x) {
@@ -180,207 +300,277 @@ std::string build_basemap() {
   return out;
 }
 
-// ---- the latest GFS cycle whose forecast hours are all published (NOMADS), cached for 10 minutes
-std::string latest_cycle() {
-  static std::mutex mu;
-  static std::string cached;
-  static std::time_t when = 0;
-  std::lock_guard<std::mutex> lk(mu);
-  const std::time_t now = std::time(nullptr);
-  if (!cached.empty() && now - when < 600) return cached;
-  for (int back = 3; back <= 48; back += 6) {
-    const std::time_t t = now - back * 3600;
-    std::tm u{};
-    gmtime_r(&t, &u);
-    u.tm_hour -= u.tm_hour % 6;
-    char ymd[16], hh[8];
-    std::strftime(ymd, sizeof ymd, "%Y%m%d", &u);
-    std::strftime(hh, sizeof hh, "%H", &u);
-    const std::string url = std::string("https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/gfs.") + ymd + "/" + hh +
-                            "/atmos/gfs.t" + hh + "z.pgrb2.0p25.f027.idx";
-    if (trim(run_cmd("curl -s -o /dev/null -w '%{http_code}' --max-time 15 '" + url + "'")) == "200") {
-      cached = std::string(ymd) + hh;
-      when = now;
-      return cached;
-    }
-  }
-  return "";
-}
-
 // ---- runs
-struct Params {
-  double lat = 0, lon = 0;
-  int dx_km = 15, nx = 60, ny = 50, nz = 40, hours = 6;
-  std::string backend = "gpu-fp32", suite = "CONUS", cycle;
-};
-struct Check {
-  bool ok = true;
-  std::string error, suggestion;
-  double gpu_mib = 0, disk_gb = 0;
-};
+bool safe_id(const std::string& s) {
+  static const std::regex re("^[0-9]{8}-[0-9]{6}-[0-9a-f]{4}$");
+  return std::regex_match(s, re);
+}
+bool safe_name(const std::string& s) {
+  static const std::regex re("^[A-Za-z0-9_.:+-]{1,96}$");
+  return std::regex_match(s, re) && s.find("..") == std::string::npos;
+}
+fs::path run_path(const std::string& id) { return runs_dir() / id; }
 
-Check check(const Params& p, bool for_start) {
-  Check c;
-  auto bad = [&](const std::string& e, const std::string& s = "") { c.ok = false; c.error = e; c.suggestion = s; };
-  if (!(std::fabs(p.lat) <= 80 && std::fabs(p.lon) <= 180)) bad("the centre must be within 80 degrees of the equator");
-  else if (p.nx > kMaxXY || p.ny > kMaxXY || p.nz > kMaxZ)
-    bad("the domain is above " + std::to_string(kMaxXY) + " x " + std::to_string(kMaxXY) + " x " + std::to_string(kMaxZ) + " points",
-        "use at most 150 x 150 points and 45 levels; for a larger area take a coarser grid spacing");
-  else if (p.nx < kMinXY || p.ny < kMinXY || p.nz < kMinZ) bad("the domain needs at least 20 x 20 points and 25 levels");
-  else if (p.hours < 1 || p.hours > kMaxHours) bad("the forecast length must be 1 to 24 hours");
-  else if (p.dx_km < 3 || p.dx_km > 30) bad("the grid spacing must be 3 to 30 km");
-  else if (p.backend != "gpu-fp32" && p.backend != "cpu-fp64") bad("unknown backend " + p.backend);
-  else if (p.suite != "CONUS" && p.suite != "tropical") bad("unknown physics suite " + p.suite);
-  else {
-    const double cells = double(p.nx) * p.ny * p.nz;
-    const int frames = p.hours + 1;
-    c.disk_gb = (cells * (kOutBytesPerCellFrame * frames + kInBytesPerCell) + 80e6) / 1e9;
-    if (p.backend == "gpu-fp32") {
-      c.gpu_mib = (kGpuFixedMiB + kGpuMiBPerCell * cells) * kGpuMargin;
-      const Gpu g = gpu();
-      if (!g.ok) bad("no NVIDIA GPU found (nvidia-smi)", "choose the CPU FP64 backend");
-      else if (c.gpu_mib > g.free - 200) {
-        const double cells_fit = ((g.free - 200) / kGpuMargin - kGpuFixedMiB) / kGpuMiBPerCell;
-        const double f = std::sqrt(std::max(0.0, cells_fit) / cells);
-        bad("the domain needs about " + num(c.gpu_mib / 1024, 1) + " GB of GPU memory; " + num(g.free / 1024, 1) +
-                " GB are free",
-            "try " + std::to_string(int(p.nx * f)) + " x " + std::to_string(int(p.ny * f)) + " points, or " +
-                std::to_string(int(std::ceil(p.dx_km / f))) + " km spacing for the same area");
-      }
-    }
-    if (c.ok && for_start) {
-      if (disk_free_gb(g_root) - c.disk_gb < kMinFreeGB)
-        bad("the run needs about " + num(c.disk_gb, 2) + " GB and would leave less than 15 GB free on the disk",
-            "delete old runs, or choose fewer hours or a smaller domain");
-      else if (repo_gb() + c.disk_gb > kMaxRepoGB)
-        bad("the run would take ~/cppwrf-web above 8 GB", "delete old runs, or choose fewer hours or a smaller domain");
+Value load_run(const std::string& id) {
+  try { return json::parse(read_file(run_path(id) / "run.json")); } catch (...) { return Value(); }
+}
+void save_run(const std::string& id, const Value& r) {
+  if (fs::exists(run_path(id))) write_atomic(run_path(id) / "run.json", json::dump(r));
+}
+
+bool terminal(const std::string& s) { return s == "done" || s == "failed" || s == "cancelled"; }
+
+// the pipeline's state file: "<stage> <pct>", "done" or "failed <stage> <message>"
+void merge_state(const std::string& id, Value& r) {
+  const fs::path d = run_path(id);
+  const std::string st = trim(read_file(d / "state"));
+  if (!st.empty() && !terminal(r["status"].str())) {
+    std::istringstream ss(st);
+    std::string a, b;
+    ss >> a >> b;
+    if (a == "done") {
+      r["status"] = "done";
+      r["stage"] = "done";
+      r["pct"] = 100;
+    } else if (a == "failed") {
+      r["status"] = "failed";
+      r["stage"] = b;
+      std::string msg;
+      std::getline(ss, msg);
+      r["message"] = trim(msg);
+    } else {
+      r["status"] = a == "download" ? "downloading" : a;
+      r["stage"] = a;
+      r["pct"] = std::atof(b.c_str());
     }
   }
-  return c;
+  // the actual seconds per stage
+  Value times = Value::object();
+  std::ifstream tf(d / "times");
+  for (std::string k; tf >> k;) { double s = 0; tf >> s; times[k] = s; }
+  if (!times.o.empty()) r["actual"]["stages_s"] = times;
 }
 
-fs::path runs_dir() { return g_root / "build/runs"; }
-
-std::string run_state(const fs::path& d) {
-  std::string s = trim(read_file(d / "state"));
-  return s.empty() ? "queued" : s;
+std::string new_id() {
+  std::time_t t = std::time(nullptr);
+  std::tm u{};
+  gmtime_r(&t, &u);
+  char b[32];
+  std::strftime(b, sizeof b, "%Y%m%d-%H%M%S", &u);
+  static std::mt19937 rng(std::random_device{}());
+  char h[8];
+  std::snprintf(h, sizeof h, "%04x", unsigned(rng() & 0xffff));
+  return std::string(b) + "-" + h;
 }
 
-std::string params_json(const Params& p) {
-  return "{\"lat\":" + num(p.lat, 3) + ",\"lon\":" + num(p.lon, 3) + ",\"dx_km\":" + std::to_string(p.dx_km) +
-         ",\"nx\":" + std::to_string(p.nx) + ",\"ny\":" + std::to_string(p.ny) + ",\"nz\":" + std::to_string(p.nz) +
-         ",\"hours\":" + std::to_string(p.hours) + ",\"backend\":\"" + esc(p.backend) + "\",\"suite\":\"" + esc(p.suite) +
-         "\",\"cycle\":\"" + esc(p.cycle) + "\"}";
-}
-
-std::string run_json(const std::string& id, bool with_log) {
-  const fs::path d = runs_dir() / id;
-  std::string j = "{\"id\":\"" + esc(id) + "\",\"params\":" + (fs::exists(d / "params.json") ? trim(read_file(d / "params.json")) : "{}") +
-                  ",\"state\":\"" + esc(run_state(d)) + "\",\"products\":" + (fs::exists(d / "products/meta.json") ? "true" : "false");
-  if (with_log) {
-    std::string log = read_file(d / "pipeline.log");
-    if (log.size() > 4000) log = log.substr(log.size() - 4000);
-    std::string tr = read_file(d / "run/translate.log");
-    j += ",\"log\":\"" + esc(log) + "\"";
-    if (run_state(d).rfind("failed model", 0) == 0 || run_state(d).find("translator") != std::string::npos)
-      j += ",\"translator\":\"" + esc(tr.size() > 3000 ? tr.substr(tr.size() - 3000) : tr) + "\"";
-  }
-  return j + "}";
-}
-
-std::vector<std::string> list_runs() {
+std::vector<std::string> list_runs() {  // newest first
   std::vector<std::string> ids;
-  if (fs::exists(runs_dir()))
-    for (const auto& e : fs::directory_iterator(runs_dir()))
-      if (e.is_directory() && fs::exists(e.path() / "params.json")) ids.push_back(e.path().filename().string());
+  std::error_code ec;
+  for (const auto& e : fs::directory_iterator(runs_dir(), ec))
+    if (e.is_directory() && safe_id(e.path().filename().string()) && fs::exists(e.path() / "run.json"))
+      ids.push_back(e.path().filename().string());
   std::sort(ids.rbegin(), ids.rend());
   return ids;
 }
 
-bool busy() {
-  std::lock_guard<std::mutex> lk(g_mu);
-  return g_child > 0;
-}
-
-// delete the oldest finished runs: beyond kKeepRuns, and while the new run would not fit
+// delete the oldest finished, unstarred runs beyond g_keep_runs, and while the disk is below the floor + need
 void cleanup(double need_gb) {
   auto ids = list_runs();
   std::reverse(ids.begin(), ids.end());  // oldest first
   int finished = 0;
-  for (const auto& id : ids) finished += run_state(runs_dir() / id).rfind("running", 0) != 0;
+  for (const auto& id : ids) if (terminal(load_run(id)["status"].str())) ++finished;
   for (const auto& id : ids) {
-    if (id == g_child_id) continue;
-    const bool over = finished >= kKeepRuns || disk_free_gb(g_root) - need_gb < kMinFreeGB || repo_gb() + need_gb > kMaxRepoGB;
-    if (!over) break;
+    const Value r = load_run(id);
+    if (!terminal(r["status"].str()) || r["starred"].boolean()) continue;
+    if (finished <= g_keep_runs && disk_free_gb() - need_gb >= kMinFreeGB) break;
     std::error_code ec;
-    fs::remove_all(runs_dir() / id, ec);
+    fs::remove_all(run_path(id), ec);
     --finished;
     std::fprintf(stderr, "cppwrf-forecast: deleted old run %s\n", id.c_str());
   }
 }
 
-void reaper() {
+// the big partial files of a run that did not finish (GFS, WPS, inputs, wrfout, products); logs and run.json stay
+void remove_partial(const std::string& id) {
+  const fs::path d = run_path(id);
+  std::error_code ec;
+  for (const char* sub : {"gfs", "wps", "run", "out", "products", "check"}) fs::remove_all(d / sub, ec);
+}
+
+// the GPU memory the model reported (CPPWRF_MEMINFO=1) and its step time
+void model_numbers(const std::string& id, Value& r) {
+  const std::string log = read_file(run_path(id) / "logs/model.log");
+  std::smatch m;
+  static const std::regex used("([0-9.]+) MiB used"), ns("([0-9.]+) ns/cell/step"), step("stepping ([0-9.]+) s");
+  double peak = 0;
+  for (auto it = std::sregex_iterator(log.begin(), log.end(), used); it != std::sregex_iterator(); ++it)
+    peak = std::max(peak, std::atof((*it)[1].str().c_str()));
+  if (peak > 0) r["actual"]["gpu_mib"] = peak;
+  if (std::regex_search(log, m, ns)) r["actual"]["ns_per_cell_step"] = std::atof(m[1].str().c_str());
+  if (std::regex_search(log, m, step)) r["actual"]["stepping_s"] = std::atof(m[1].str().c_str());
+}
+
+void finish_run(const std::string& id, int status) {
+  Value r = load_run(id);
+  if (r.is_null()) return;  // deleted while it ran
+  merge_state(id, r);
+  if (!terminal(r["status"].str())) {
+    r["status"] = "failed";
+    r["message"] = "İşlem hattı beklenmedik biçimde bitti (çıkış " + std::to_string(status) + ").";
+  }
+  r["ended"] = now_iso();
+  model_numbers(id, r);
+  double total = 0;
+  for (const auto& [k, v] : r["actual"]["stages_s"].o) total += v.num();
+  if (total > 0) r["actual"]["total_s"] = total;
+  if (r["status"].str() != "done" && !r["settings"]["keep_partial"].boolean()) remove_partial(id);
+  if (r["status"].str() == "done") {
+    std::error_code ec;
+    fs::remove_all(run_path(id) / "check", ec);
+  }
+  r["disk_bytes"] = double(dir_bytes(run_path(id)));
+  r.o.erase("pgid");
+  save_run(id, r);
+  // refine the calibration with this run's numbers
+  if (r["status"].str() == "done" && fs::exists(g_root / "tools/calibrate.py"))
+    run_prog({"python3", "-I", (g_root / "tools/calibrate.py").string(), "add", run_path(id).string()}, g_root, 60);
+}
+
+void launch(const std::string& id) {
+  const fs::path d = run_path(id);
+  fs::create_directories(d / "logs");
+  const pid_t pid = fork();
+  if (pid == 0) {
+    setpgid(0, 0);
+    const std::string log = (d / "logs/pipeline.log").string();
+    const int fd = open(log.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
+    const std::string script = (g_root / "forecast/pipeline.sh").string(), dir = d.string();
+    char* argv[] = {const_cast<char*>("bash"), const_cast<char*>(script.c_str()), const_cast<char*>(dir.c_str()), nullptr};
+    execvp("bash", argv);
+    _exit(127);
+  }
+  if (pid > 0) setpgid(pid, pid);
+  g_child = pid;
+  g_child_id = id;
+  Value r = load_run(id);
+  r["status"] = "downloading";
+  r["stage"] = "download";
+  r["started"] = now_iso();
+  r["pgid"] = int(pid);
+  save_run(id, r);
+}
+
+// the queue: start the next run when none runs; reap the running one
+void worker() {
   while (true) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    std::lock_guard<std::mutex> lk(g_mu);
-    if (g_child <= 0) continue;
-    int st;
-    if (waitpid(g_child, &st, WNOHANG) == g_child) {
-      const fs::path d = runs_dir() / g_child_id;
-      if (run_state(d).rfind("running", 0) == 0 || run_state(d) == "queued")
-        std::ofstream(d / "state") << "failed stopped the pipeline ended (exit " << (WIFEXITED(st) ? WEXITSTATUS(st) : -1) << ")\n";
-      g_child = -1;
-      g_child_id.clear();
+    std::unique_lock<std::mutex> lk(g_mu);
+    g_cv.wait_for(lk, std::chrono::milliseconds(500));
+    if (g_child > 0) {
+      int st = 0;
+      if (waitpid(g_child, &st, WNOHANG) == g_child) {
+        const std::string id = g_child_id;
+        g_child = -1;
+        g_child_id.clear();
+        finish_run(id, WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+      }
+    }
+    if (g_child <= 0 && !g_queue.empty()) {
+      const std::string id = g_queue.front();
+      g_queue.pop_front();
+      if (load_run(id)["status"].str() == "queued") {
+        cleanup(load_run(id)["estimate"]["disk_peak_bytes"].num() / 1e9);
+        if (disk_free_gb() < kMinFreeGB + 0.5) {
+          Value r = load_run(id);
+          r["status"] = "failed";
+          r["message"] = "Diskte 15 GB'tan az boş yer var; çalışma başlatılmadı.";
+          save_run(id, r);
+          remove_partial(id);
+        } else {
+          launch(id);
+        }
+      }
     }
   }
 }
 
-std::string start_run(const Params& p0, int& status) {
-  Params p = p0;
-  if (busy()) { status = 409; return "{\"error\":\"a forecast is already running; one at a time\"}"; }
-  if (p.cycle.empty()) p.cycle = latest_cycle();
-  if (p.cycle.empty()) { status = 503; return "{\"error\":\"no GFS cycle found on NOMADS (network?)\"}"; }
-  Check c = check(p, false);
-  if (c.ok) { cleanup(c.disk_gb); c = check(p, true); }
-  if (!c.ok) { status = 422; return "{\"error\":\"" + esc(c.error) + "\",\"suggestion\":\"" + esc(c.suggestion) + "\"}"; }
-  char id[32];
-  const std::time_t now = std::time(nullptr);
-  std::strftime(id, sizeof id, "%Y%m%d-%H%M%S", std::localtime(&now));
-  const fs::path d = runs_dir() / id;
-  fs::create_directories(d);
-  std::ofstream(d / "params.json") << params_json(p) << "\n";
-  std::ofstream(d / "state") << "running queued 0\n";
-  const pid_t pid = fork();
-  if (pid == 0) {
-    setsid();
-    const std::string log = (d / "pipeline.log").string();
-    std::freopen(log.c_str(), "w", stdout);
-    std::freopen(log.c_str(), "a", stderr);
-    setenv("LAT", num(p.lat, 4).c_str(), 1);
-    setenv("LON", num(p.lon, 4).c_str(), 1);
-    setenv("DX_KM", std::to_string(p.dx_km).c_str(), 1);
-    setenv("NX", std::to_string(p.nx).c_str(), 1);
-    setenv("NY", std::to_string(p.ny).c_str(), 1);
-    setenv("NZ", std::to_string(p.nz).c_str(), 1);
-    setenv("HOURS", std::to_string(p.hours).c_str(), 1);
-    setenv("CYCLE", p.cycle.c_str(), 1);
-    setenv("BACKEND", p.backend.c_str(), 1);
-    setenv("SUITE", p.suite.c_str(), 1);
-    const std::string script = (g_root / "forecast/pipeline.sh").string();
-    execl("/bin/bash", "bash", script.c_str(), d.c_str(), static_cast<char*>(nullptr));
-    _exit(127);
+// SIGTERM to the process group, SIGKILL after 10 s (the lock is not held while waiting)
+void stop_group(pid_t pgid) {
+  if (pgid <= 0) return;
+  kill(-pgid, SIGTERM);
+  for (int k = 0; k < 100; ++k) {
+    if (kill(-pgid, 0) != 0) return;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
-  {
-    std::lock_guard<std::mutex> lk(g_mu);
-    g_child = pid;
-    g_child_id = id;
-  }
-  status = 202;
-  return run_json(id, false);
+  kill(-pgid, SIGKILL);
 }
 
-// ---- HTTP
-struct Req { std::string method, path, body; };
+// a run's pipeline still alive after a server restart (its process group, running pipeline.sh)
+bool pipeline_alive(pid_t pgid, const std::string& id) {
+  if (pgid <= 0 || kill(-pgid, 0) != 0) return false;
+  const std::string cmd = read_file("/proc/" + std::to_string(pgid) + "/cmdline");
+  return cmd.find("pipeline.sh") != std::string::npos && cmd.find(id) != std::string::npos;
+}
+
+void recover() {
+  for (const auto& id : list_runs()) {
+    Value r = load_run(id);
+    const std::string s = r["status"].str();
+    if (s == "queued") { g_queue.push_back(id); continue; }
+    if (terminal(s)) continue;
+    const pid_t pg = pid_t(r["pgid"].num(-1));
+    if (pipeline_alive(pg, id)) stop_group(pg);
+    merge_state(id, r);
+    if (!terminal(r["status"].str())) {
+      r["status"] = "failed";
+      r["message"] = "Sunucu bu çalışma sürerken yeniden başladı; çalışma durduruldu.";
+    }
+    r["ended"] = now_iso();
+    r.o.erase("pgid");
+    save_run(id, r);
+    if (r["status"].str() != "done" && !r["settings"]["keep_partial"].boolean()) remove_partial(id);
+    std::fprintf(stderr, "cppwrf-forecast: run %s was left %s: %s\n", id.c_str(), s.c_str(), r["status"].str().c_str());
+  }
+  std::sort(g_queue.begin(), g_queue.end());
+}
+
+// ---- requests
+Value error_value(const std::string& msg) {
+  Value r = Value::object();
+  r["ok"] = false;
+  r["level"] = "red";
+  Value er = Value::object();
+  er["field"] = "";
+  er["message"] = msg;
+  r["errors"].push(er);
+  return r;
+}
+
+Value check_settings(const std::string& body, const Value& sys, const fs::path& run = {}) {
+  Value settings;
+  try { settings = json::parse(body); } catch (const std::exception& e) { return error_value(std::string("Geçersiz JSON: ") + e.what()); }
+  if (!settings.is_object()) return error_value("Ayarlar bir JSON nesnesi olmalı.");
+  // "latest": the newest complete GFS cycle
+  if (settings["time"]["cycle"].str("latest") == "latest") {
+    const std::string c = cycles()["latest"].str();
+    if (c.empty()) return error_value("Tamamlanmış bir GFS çevrimi bulunamadı (ağ bağlantısı?).");
+    settings["time"]["cycle"] = c;
+  }
+  fs::create_directories(g_root / "build/tmp");
+  static std::atomic<unsigned> counter{0};
+  const std::string tag = std::to_string(::getpid()) + "-" + std::to_string(counter++);
+  const fs::path sf = g_root / "build/tmp" / ("settings-" + tag + ".json"), yf = g_root / "build/tmp" / ("system-" + tag + ".json");
+  write_atomic(sf, json::dump(settings));
+  write_atomic(yf, system_for_prepare(sys));
+  std::vector<std::string> argv = {"python3", "-I", (g_root / "forecast/prepare.py").string(), run.empty() ? "check" : "setup",
+                                   sf.string(), yf.string()};
+  if (!run.empty()) argv.push_back(run.string());
+  const Proc p = run_prog(argv, g_root, 120);
+  std::error_code ec;
+  fs::remove(sf, ec);
+  fs::remove(yf, ec);
+  try { return json::parse(p.out); } catch (...) { return error_value("Ayarlar denetlenemedi (prepare.py)."); }
+}
 
 void send_all(int fd, const std::string& s) {
   size_t o = 0;
@@ -391,169 +581,370 @@ void send_all(int fd, const std::string& s) {
   }
 }
 void reply(int fd, int code, const std::string& type, const std::string& body, const std::string& extra = "") {
-  const char* text = code == 200 ? "OK" : code == 202 ? "Accepted" : code == 404 ? "Not Found" : code == 409 ? "Conflict"
-                   : code == 422 ? "Unprocessable Entity" : code == 503 ? "Service Unavailable" : "Bad Request";
+  const char* text = code == 200 ? "OK" : code == 201 ? "Created" : code == 404 ? "Not Found" : code == 409 ? "Conflict"
+                   : code == 413 ? "Payload Too Large" : code == 422 ? "Unprocessable Entity" : code == 405 ? "Method Not Allowed"
+                   : code == 503 ? "Service Unavailable" : code == 403 ? "Forbidden" : "Bad Request";
   send_all(fd, "HTTP/1.1 " + std::to_string(code) + " " + text + "\r\nContent-Type: " + type +
                    "\r\nContent-Length: " + std::to_string(body.size()) +
-                   "\r\nCache-Control: no-store\r\nConnection: close\r\n" + extra + "\r\n" + body);
+                   "\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n" + t_cors +
+                   (extra.empty() ? "Cache-Control: no-store\r\n" : extra) + "\r\n" + body);
+}
+void reply_json(int fd, int code, const Value& v) { reply(fd, code, "application/json; charset=utf-8", json::dump(v)); }
+void error_json(int fd, int code, const std::string& msg) {
+  Value v = Value::object();
+  v["error"] = msg;
+  reply_json(fd, code, v);
 }
 const char* mime(const std::string& p) {
   if (p.ends_with(".html")) return "text/html; charset=utf-8";
-  if (p.ends_with(".js")) return "text/javascript; charset=utf-8";
+  if (p.ends_with(".js") || p.ends_with(".mjs")) return "text/javascript; charset=utf-8";
   if (p.ends_with(".css")) return "text/css; charset=utf-8";
-  if (p.ends_with(".json")) return "application/json";
+  if (p.ends_with(".json")) return "application/json; charset=utf-8";
   if (p.ends_with(".svg")) return "image/svg+xml";
+  if (p.ends_with(".png")) return "image/png";
+  if (p.ends_with(".woff2")) return "font/woff2";
+  if (p.ends_with(".log") || p.ends_with(".txt") || p.ends_with(".md")) return "text/plain; charset=utf-8";
   return "application/octet-stream";
 }
-bool safe_id(const std::string& s) {
-  return !s.empty() && s.size() < 40 && std::all_of(s.begin(), s.end(), [](char c) { return std::isalnum(c) || c == '-'; });
+void send_file(int fd, const fs::path& p, const std::string& cache = "") {
+  std::error_code ec;
+  if (!fs::is_regular_file(p, ec)) { error_json(fd, 404, "Bulunamadı."); return; }
+  reply(fd, 200, mime(p.string()), read_file(p), cache);
 }
 
-Params params_from(const std::map<std::string, std::string>& m) {
-  Params p;
-  auto d = [&](const char* k, double def) { auto i = m.find(k); return i == m.end() ? def : std::atof(i->second.c_str()); };
-  auto s = [&](const char* k, const std::string& def) { auto i = m.find(k); return i == m.end() ? def : i->second; };
-  p.lat = d("lat", 0); p.lon = d("lon", 0);
-  p.dx_km = int(d("dx_km", 15)); p.nx = int(d("nx", 60)); p.ny = int(d("ny", 50)); p.nz = int(d("nz", 40));
-  p.hours = int(d("hours", 6)); p.backend = s("backend", "gpu-fp32"); p.suite = s("suite", "CONUS");
-  return p;
+// Server-Sent Events: the progress of one run, once a second until it ends
+void events(int fd, const std::string& id) {
+  send_all(fd, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-store\r\n"
+               "Connection: close\r\n" + t_cors + "\r\n");
+  const fs::path d = run_path(id);
+  while (true) {
+    Value r;
+    {
+      std::lock_guard<std::mutex> lk(g_mu);
+      r = load_run(id);
+      if (!r.is_null()) {
+        merge_state(id, r);
+        if (r["status"].str() == "queued") {
+          int pos = 1;
+          for (const auto& q : g_queue) { if (q == id) break; ++pos; }
+          r["queue_position"] = pos;
+        }
+      }
+    }
+    if (r.is_null()) return;
+    Value e = Value::object();
+    for (const char* k : {"status", "stage", "pct", "message", "actual", "queue_position"}) if (r.has(k)) e[k] = r[k];
+    const double run_s = r["settings"]["time"]["hours"].num() * 3600;
+    // the model's progress from diag.csv: step, simulated time, max|u|, max|v|, ..., wall seconds (last column)
+    const std::string diag = read_file(d / "out/diag.csv");
+    if (diag.size() > 2) {
+      const size_t end = diag.find_last_not_of('\n');
+      const size_t nl = diag.rfind('\n', end);
+      const size_t beg = nl == std::string::npos ? 0 : nl + 1;
+      std::vector<std::string> f;
+      std::stringstream ss(diag.substr(beg, end - beg + 1));
+      for (std::string x; std::getline(ss, x, ',');) f.push_back(x);
+      if (f.size() > 3 && std::isdigit(static_cast<unsigned char>(f[0][0]))) {
+        const double step = std::atof(f[0].c_str()), sim = std::atof(f[1].c_str()), wall = std::atof(f.back().c_str());
+        e["sim_s"] = sim;
+        e["run_s"] = run_s;
+        e["wall_s"] = wall;
+        e["step"] = step;
+        e["max_wind"] = std::max(std::atof(f[2].c_str()), std::atof(f[3].c_str()));
+        if (wall > 0 && sim > 0) {
+          e["sim_per_wall"] = sim / wall;
+          e["steps_per_s"] = step / wall;
+          e["model_remaining_s"] = std::max(0.0, (run_s - sim) * wall / sim);
+        }
+      }
+    }
+    int frames = 0;
+    std::error_code ec;
+    for (const auto& f : fs::directory_iterator(d / "products", ec))
+      if (f.path().filename().string().rfind("frame_", 0) == 0) ++frames;
+    e["frames"] = frames;
+    // the log tail of the running stage
+    const std::string stage = r["stage"].str();
+    std::string logname = stage;
+    if (stage == "wps")
+      for (const char* p : {"geogrid", "ungrib", "metgrid"})
+        if (fs::exists(d / "logs" / (std::string(p) + ".log"))) logname = p;
+    std::string tail = read_file(d / "logs" / (logname + ".log"));
+    if (tail.size() > 2000) tail = tail.substr(tail.size() - 2000);
+    e["log_stage"] = logname;
+    e["log_tail"] = tail;
+    send_all(fd, "data: " + json::dump(e) + "\n\n");
+    char probe;
+    if (::recv(fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT) == 0) return;  // the page went away
+    if (terminal(r["status"].str())) return;
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+  }
+}
+
+void api(int fd, const std::string& M, const std::vector<std::string>& seg, const std::string& body) {
+  if (seg.size() == 1 && seg[0] == "system" && M == "GET") { reply_json(fd, 200, system_info()); return; }
+  if (seg.size() == 1 && seg[0] == "options" && M == "GET") {
+    static std::string opts;
+    static std::mutex mu;
+    std::lock_guard<std::mutex> lk(mu);
+    if (opts.empty()) opts = run_prog({"python3", "-I", (g_root / "forecast/prepare.py").string(), "options"}, g_root).out;
+    reply(fd, 200, "application/json; charset=utf-8", opts);
+    return;
+  }
+  if (seg.size() == 1 && seg[0] == "cycles" && M == "GET") { reply_json(fd, 200, cycles()); return; }
+  if (seg.size() == 1 && seg[0] == "basemap" && M == "GET") {
+    reply(fd, 200, "application/octet-stream", build_basemap(), "Cache-Control: max-age=86400\r\n");
+    return;
+  }
+  if (seg.size() == 1 && seg[0] == "estimate" && M == "POST") { reply_json(fd, 200, check_settings(body, system_info())); return; }
+  if (seg.size() == 1 && seg[0] == "runs" && M == "GET") {
+    Value list = Value::array();
+    std::lock_guard<std::mutex> lk(g_mu);
+    for (const auto& id : list_runs()) {
+      Value r = load_run(id);
+      merge_state(id, r);
+      r.o.erase("system");
+      list.push(r);
+    }
+    reply_json(fd, 200, list);
+    return;
+  }
+  if (seg.size() == 1 && seg[0] == "runs" && M == "POST") {
+    const Value sys = system_info();
+    const std::string id = new_id();
+    const fs::path d = run_path(id);
+    fs::create_directories(d / "logs");
+    Value chk = check_settings(body, sys, d);
+    if (!chk["ok"].boolean()) {
+      std::error_code ec;
+      fs::remove_all(d, ec);
+      reply_json(fd, 422, chk);
+      return;
+    }
+    Value r = Value::object();
+    r["id"] = id;
+    r["created"] = now_iso();
+    r["status"] = "queued";
+    r["stage"] = "queued";
+    for (const char* k : {"settings", "estimate", "other_modes", "derived", "warnings", "level"}) r[k] = chk[k];
+    r["cppwrf_commit"] = cppwrf_commit();
+    r["system"] = sys;
+    r["starred"] = false;
+    {
+      std::lock_guard<std::mutex> lk(g_mu);
+      save_run(id, r);
+      g_queue.push_back(id);
+      r["queue_position"] = int(g_queue.size()) + (g_child > 0 ? 1 : 0);
+    }
+    g_cv.notify_all();
+    reply_json(fd, 201, r);
+    return;
+  }
+  if (seg.size() >= 2 && seg[0] == "runs") {
+    const std::string id = seg[1];
+    if (!safe_id(id) || !fs::exists(run_path(id) / "run.json")) { error_json(fd, 404, "Böyle bir çalışma yok."); return; }
+    if (seg.size() == 2 && M == "GET") {
+      std::lock_guard<std::mutex> lk(g_mu);
+      Value r = load_run(id);
+      merge_state(id, r);
+      reply_json(fd, 200, r);
+      return;
+    }
+    if (seg.size() == 2 && M == "DELETE") {
+      pid_t pg = -1;
+      {
+        std::lock_guard<std::mutex> lk(g_mu);
+        if (g_child_id == id) pg = g_child;
+        g_queue.erase(std::remove(g_queue.begin(), g_queue.end(), id), g_queue.end());
+      }
+      if (pg > 0) stop_group(pg);
+      std::lock_guard<std::mutex> lk(g_mu);
+      std::error_code ec;
+      fs::remove_all(run_path(id), ec);
+      Value v = Value::object();
+      v["ok"] = true;
+      reply_json(fd, 200, v);
+      return;
+    }
+    if (seg.size() == 3 && seg[2] == "cancel" && M == "POST") {
+      pid_t pg = -1;
+      {
+        std::lock_guard<std::mutex> lk(g_mu);
+        Value r = load_run(id);
+        if (terminal(r["status"].str())) { reply_json(fd, 200, r); return; }
+        if (g_child_id == id) pg = g_child;
+        g_queue.erase(std::remove(g_queue.begin(), g_queue.end(), id), g_queue.end());
+        r["status"] = "cancelled";
+        r["message"] = "Kullanıcı iptal etti.";
+        r["ended"] = now_iso();
+        save_run(id, r);
+      }
+      if (pg > 0) stop_group(pg);  // the worker reaps it; finish_run keeps "cancelled" and removes the partial files
+      else {
+        std::lock_guard<std::mutex> lk(g_mu);
+        if (!load_run(id)["settings"]["keep_partial"].boolean()) remove_partial(id);
+      }
+      std::lock_guard<std::mutex> lk(g_mu);
+      reply_json(fd, 200, load_run(id));
+      return;
+    }
+    if (seg.size() == 3 && seg[2] == "star" && M == "POST") {
+      Value b;
+      try { b = json::parse(body); } catch (...) { error_json(fd, 400, "Geçersiz JSON."); return; }
+      std::lock_guard<std::mutex> lk(g_mu);
+      Value r = load_run(id);
+      r["starred"] = b["starred"].boolean(true);
+      save_run(id, r);
+      reply_json(fd, 200, r);
+      return;
+    }
+    if (seg.size() == 3 && seg[2] == "events" && M == "GET") { events(fd, id); return; }
+    if (seg.size() == 4 && seg[2] == "logs" && M == "GET" && safe_name(seg[3])) {
+      send_file(fd, run_path(id) / "logs" / (seg[3] + ".log"));
+      return;
+    }
+    if (seg.size() == 4 && seg[2] == "products" && M == "GET" && safe_name(seg[3])) {
+      send_file(fd, run_path(id) / "products" / seg[3], seg[3].ends_with(".bin") ? "Cache-Control: max-age=600\r\n" : "");
+      return;
+    }
+    if ((seg.size() == 4 || seg.size() == 5) && seg[2] == "out" && M == "GET" && safe_name(seg.back()) &&
+        seg.back().rfind("wrfout_", 0) == 0) {
+      fs::path p = run_path(id) / "out";
+      if (seg.size() == 5) {
+        static const std::regex dn("^d0[1-9]$");
+        if (!std::regex_match(seg[3], dn)) { error_json(fd, 404, "Bulunamadı."); return; }
+        p /= seg[3];
+      }
+      send_file(fd, p / seg.back(), "Content-Disposition: attachment\r\nCache-Control: no-store\r\n");
+      return;
+    }
+    if (seg.size() == 3 && seg[2] == "files" && M == "GET") {
+      Value list = Value::array();
+      std::error_code ec;
+      for (auto it = fs::recursive_directory_iterator(run_path(id) / "out", ec); it != fs::recursive_directory_iterator(); it.increment(ec)) {
+        const std::string n = it->path().filename().string();
+        if (n.rfind("wrfout_", 0) == 0) {
+          Value f = Value::object();
+          f["path"] = fs::relative(it->path(), run_path(id) / "out").string();
+          f["bytes"] = double(it->file_size(ec));
+          list.push(f);
+        }
+      }
+      reply_json(fd, 200, list);
+      return;
+    }
+  }
+  error_json(fd, 404, "Bilinmeyen API adresi.");
 }
 
 void handle(int fd) {
   std::string buf;
   char tmp[8192];
   size_t hdr_end = std::string::npos;
-  while (hdr_end == std::string::npos && buf.size() < 65536) {
+  while (hdr_end == std::string::npos && buf.size() < kMaxRequest) {
     const ssize_t n = ::recv(fd, tmp, sizeof tmp, 0);
     if (n <= 0) return;
     buf.append(tmp, size_t(n));
     hdr_end = buf.find("\r\n\r\n");
   }
-  if (hdr_end == std::string::npos) return;
-  Req q;
+  if (hdr_end == std::string::npos) { error_json(fd, 413, "İstek çok büyük."); return; }
+  std::string method, path;
   std::istringstream hs(buf.substr(0, hdr_end));
-  hs >> q.method >> q.path;
+  hs >> method >> path;
   size_t len = 0;
+  std::string origin;
   for (std::string line; std::getline(hs, line);) {
     std::string l = line;
     std::transform(l.begin(), l.end(), l.begin(), ::tolower);
     if (l.rfind("content-length:", 0) == 0) len = size_t(std::atol(l.c_str() + 15));
+    if (l.rfind("origin:", 0) == 0) origin = trim(line.substr(7));
   }
-  q.body = buf.substr(hdr_end + 4);
-  while (q.body.size() < len && q.body.size() < 65536) {
+  // the site may also be opened from GitHub Pages: those origins get CORS (and Private Network Access) headers;
+  // any other foreign origin may read nothing and change nothing
+  t_cors.clear();
+  const bool same = origin.empty() || origin == "http://127.0.0.1:" + std::to_string(g_port) ||
+                    origin == "http://localhost:" + std::to_string(g_port);
+  const bool allowed = std::find(g_origins.begin(), g_origins.end(), origin) != g_origins.end();
+  if (allowed) t_cors = "Access-Control-Allow-Origin: " + origin + "\r\nVary: Origin\r\n";
+  if (method == "OPTIONS") {
+    if (!allowed) { error_json(fd, 403, "Bu kaynağa izin yok."); return; }
+    send_all(fd, "HTTP/1.1 204 No Content\r\n" + t_cors +
+                     "Access-Control-Allow-Methods: GET, POST, DELETE\r\nAccess-Control-Allow-Headers: Content-Type\r\n"
+                     "Access-Control-Allow-Private-Network: true\r\nAccess-Control-Max-Age: 600\r\n"
+                     "Content-Length: 0\r\nConnection: close\r\n\r\n");
+    return;
+  }
+  if (!same && !allowed && method != "GET") { error_json(fd, 403, "Bu kaynağa izin yok."); return; }
+  if (len > kMaxRequest) { error_json(fd, 413, "İstek çok büyük."); return; }
+  std::string body = buf.substr(hdr_end + 4);
+  while (body.size() < len) {
     const ssize_t n = ::recv(fd, tmp, sizeof tmp, 0);
     if (n <= 0) break;
-    q.body.append(tmp, size_t(n));
+    body.append(tmp, size_t(n));
   }
-  if (const auto qm = q.path.find('?'); qm != std::string::npos) q.path.resize(qm);
-  const std::string json = "application/json";
-
-  if (q.path == "/api/info") {
-    const Gpu g = gpu();
-    reply(fd, 200, json,
-          "{\"gpu\":{\"ok\":" + std::string(g.ok ? "true" : "false") + ",\"name\":\"" + esc(g.name) +
-              "\",\"total_mib\":" + num(g.total, 0) + ",\"free_mib\":" + num(g.free, 0) + "},\"disk_free_gb\":" +
-              num(disk_free_gb(g_root), 1) + ",\"repo_gb\":" + num(repo_gb(), 2) + ",\"cycle\":\"" + esc(latest_cycle()) +
-              "\",\"busy\":" + (busy() ? "true" : "false") +
-              ",\"limits\":{\"max_xy\":150,\"max_z\":45,\"min_xy\":20,\"min_z\":25,\"max_hours\":24,\"min_free_gb\":15,\"max_repo_gb\":8}}");
-  } else if (q.path == "/api/basemap") {
-    reply(fd, 200, "application/octet-stream", build_basemap(), "Cache-Control: max-age=86400\r\n");
-  } else if (q.path == "/api/runs" && q.method == "GET") {
-    std::string j = "[";
-    for (const auto& id : list_runs()) j += (j.size() > 1 ? "," : "") + run_json(id, false);
-    reply(fd, 200, json, j + "]");
-  } else if ((q.path == "/api/runs" || q.path == "/api/estimate") && q.method == "POST") {
-    const Params p = params_from(parse_flat(q.body));
-    if (q.path == "/api/estimate") {
-      const Check c = check(p, true);
-      reply(fd, 200, json, "{\"ok\":" + std::string(c.ok ? "true" : "false") + ",\"error\":\"" + esc(c.error) +
-                               "\",\"suggestion\":\"" + esc(c.suggestion) + "\",\"gpu_gb\":" + num(c.gpu_mib / 1024, 2) +
-                               ",\"disk_gb\":" + num(c.disk_gb, 2) + "}");
-    } else {
-      int status = 200;
-      const std::string r = start_run(p, status);
-      reply(fd, status, json, r);
-    }
-  } else if (q.path.rfind("/api/runs/", 0) == 0) {
-    std::string rest = q.path.substr(10), id = rest, sub;
-    if (const auto s = rest.find('/'); s != std::string::npos) { id = rest.substr(0, s); sub = rest.substr(s + 1); }
-    const fs::path d = runs_dir() / id;
-    if (!safe_id(id) || !fs::exists(d / "params.json")) { reply(fd, 404, json, "{\"error\":\"no such run\"}"); return; }
-    if (sub.empty()) reply(fd, 200, json, run_json(id, true));
-    else if (sub == "cancel" && q.method == "POST") {
-      std::lock_guard<std::mutex> lk(g_mu);
-      if (g_child > 0 && g_child_id == id) {
-        kill(-g_child, SIGTERM);
-        std::ofstream(d / "state") << "failed cancelled by the user\n";
-      }
-      reply(fd, 200, json, "{\"ok\":true}");
-    } else if (sub == "delete" && q.method == "POST") {
-      if (busy() && g_child_id == id) { reply(fd, 409, json, "{\"error\":\"the run is still going\"}"); return; }
-      std::error_code ec;
-      fs::remove_all(d, ec);
-      reply(fd, 200, json, "{\"ok\":true}");
-    } else if (sub == "wrfout") {
-      for (const auto& e : fs::directory_iterator(d / "out"))
-        if (e.path().filename().string().rfind("wrfout_d01_", 0) == 0) {
-          std::string name = e.path().filename().string();
-          std::replace(name.begin(), name.end(), ':', '_');
-          reply(fd, 200, "application/x-netcdf", read_file(e.path()),
-                "Content-Disposition: attachment; filename=\"" + name + "\"\r\n");
-          return;
-        }
-      reply(fd, 404, json, "{\"error\":\"no wrfout\"}");
-    } else if (sub == "meta.json" || sub == "static.bin" ||
-               (sub.rfind("frame_", 0) == 0 && sub.ends_with(".bin") && sub.size() == 13 &&
-                std::all_of(sub.begin() + 6, sub.begin() + 9, ::isdigit))) {
-      const fs::path f = d / "products" / sub;
-      if (fs::exists(f)) reply(fd, 200, mime(sub), read_file(f));
-      else reply(fd, 404, json, "{\"error\":\"not yet\"}");
-    } else reply(fd, 404, json, "{\"error\":\"unknown\"}");
-  } else {
-    // the page: forecast/web
-    std::string p = q.path == "/" ? "/index.html" : q.path;
-    if (p.find("..") != std::string::npos) { reply(fd, 400, "text/plain", "bad path"); return; }
-    const fs::path f = g_root / "forecast/web" / p.substr(1);
-    if (fs::is_regular_file(f)) reply(fd, 200, mime(p), read_file(f));
-    else reply(fd, 404, "text/plain", "not found");
+  if (body.size() > len) body.resize(len);
+  if (const auto qm = path.find('?'); qm != std::string::npos) path.resize(qm);
+  std::vector<std::string> seg;
+  {
+    std::stringstream ss(path);
+    for (std::string x; std::getline(ss, x, '/');) if (!x.empty()) seg.push_back(x);
   }
+  if (seg.size() >= 2 && seg[0] == "api" && seg[1] == "v1") {
+    seg.erase(seg.begin(), seg.begin() + 2);
+    api(fd, method, seg, body);
+    return;
+  }
+  if (method != "GET") { error_json(fd, 405, "Yalnızca GET."); return; }
+  // the site: files under forecast/web only
+  const std::string rel = path == "/" ? "index.html" : path.substr(1);
+  static const std::regex ok("^[A-Za-z0-9_][A-Za-z0-9_./-]{0,200}$");
+  if (!std::regex_match(rel, ok) || rel.find("..") != std::string::npos) { error_json(fd, 404, "Bulunamadı."); return; }
+  const fs::path web = fs::weakly_canonical(g_root / "forecast/web");
+  const fs::path p = fs::weakly_canonical(web / rel);
+  if (p.string().rfind(web.string() + "/", 0) != 0) { error_json(fd, 404, "Bulunamadı."); return; }
+  send_file(fd, p, "Cache-Control: no-cache\r\n");
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
   int port = 8090;
-  for (int a = 1; a + 1 < argc; ++a)
-    if (std::string(argv[a]) == "--port") port = std::atoi(argv[a + 1]);
-  g_root = std::getenv("CPPWRF_WEB_ROOT") ? fs::path(std::getenv("CPPWRF_WEB_ROOT")) : fs::current_path();
+  for (int i = 1; i + 1 < argc; ++i)
+    if (std::string(argv[i]) == "--port") port = std::atoi(argv[i + 1]);
+  g_port = port;
+  if (const char* o = std::getenv("CPPWRF_ALLOWED_ORIGINS")) {
+    g_origins.clear();
+    std::stringstream ss(o);
+    for (std::string x; std::getline(ss, x, ',');) if (!trim(x).empty()) g_origins.push_back(trim(x));
+  }
+  g_root = fs::absolute(std::getenv("CPPWRF_WEB_ROOT") ? std::getenv("CPPWRF_WEB_ROOT") : ".");
+  if (const char* k = std::getenv("CPPWRF_KEEP_RUNS")) g_keep_runs = std::max(1, std::atoi(k));
   if (!fs::exists(g_root / "forecast/pipeline.sh")) {
-    std::fprintf(stderr, "cppwrf-forecast: run it from the cppwrf-web repository (or set CPPWRF_WEB_ROOT)\n");
-    return 2;
+    std::fprintf(stderr, "cppwrf-forecast: run it from the repository root (or set CPPWRF_WEB_ROOT)\n");
+    return 1;
   }
   fs::create_directories(runs_dir());
-  // runs left "running" by an earlier server: their pipeline is gone
-  for (const auto& id : list_runs())
-    if (run_state(runs_dir() / id).rfind("running", 0) == 0)
-      std::ofstream(runs_dir() / id / "state") << "failed stopped the server restarted\n";
   signal(SIGPIPE, SIG_IGN);
-  std::thread(reaper).detach();
-  std::thread([] { build_basemap(); }).detach();
+  recover();
+  std::thread(worker).detach();
 
   const int s = socket(AF_INET, SOCK_STREAM, 0);
-  int one = 1;
+  const int one = 1;
   setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
   sockaddr_in a{};
   a.sin_family = AF_INET;
-  a.sin_port = htons(uint16_t(port));
   a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);  // 127.0.0.1 only
+  a.sin_port = htons(uint16_t(port));
   if (bind(s, reinterpret_cast<sockaddr*>(&a), sizeof a) != 0 || listen(s, 32) != 0) {
     std::perror("cppwrf-forecast: bind 127.0.0.1");
     return 1;
   }
-  std::fprintf(stderr, "cppwrf-forecast: http://127.0.0.1:%d/ (root %s)\n", port, g_root.c_str());
+  std::fprintf(stderr, "cppwrf-forecast: http://127.0.0.1:%d/ (CPPWRF %s)\n", port, cppwrf_commit().c_str());
   while (true) {
     const int c = accept(s, nullptr, nullptr);
     if (c < 0) continue;
+    timeval tv{30, 0};
+    setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     std::thread([c] { handle(c); close(c); }).detach();
   }
 }

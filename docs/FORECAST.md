@@ -18,25 +18,20 @@ Everything runs locally. The server listens on 127.0.0.1 only and has no login.
 | `forecast/server/server.cpp` | the HTTP server: checks, estimates, starts and cancels runs, serves products and the page |
 | `forecast/server/wrfpost.cpp` | wrfout → `meta.json`, `static.bin` and one `frame_NNN.bin` per output time |
 | `forecast/web/` | the page (`index.html`, `app.js`, `style.css`): plain HTML, CSS and JS, no library |
-| `tools/cppwrf_overlay.sh` | copies the CPPWRF submodule to `build/cppwrf-src` and applies `upstream-patches/REQUIRED` |
+| `forecast/prepare.py` | settings checks, namelists, the translator check and the cost estimate |
+| `tools/build_all.sh` | the CPPWRF builds (CPU FP64, GPU FP32, GPU FP64) and the server |
 
 ## Build
 
-CPPWRF is never built inside the submodule. The CUDA build needs patch 0002 (nvcc 12.4 cannot deduce the type of
-a braced list in a range-for loop in `real_case.cpp`), so it is built from an overlay copy:
+CPPWRF is built from the submodule `third_party/CPPWRF` (pinned; 36b9b63 or newer), never inside it:
 
 ```bash
-tools/cppwrf_overlay.sh
-cmake -S third_party/CPPWRF -B build/native -G Ninja -DCMAKE_BUILD_TYPE=Release -DCPPWRF_DOUBLE=ON
-nice -n 10 cmake --build build/native -j4             # CPU FP64: cppwrf and cppwrf_real
-cmake -S build/cppwrf-src -B build/native-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release \
-      -DCPPWRF_ENABLE_CUDA=ON -DCPPWRF_DOUBLE=OFF -DCMAKE_CUDA_ARCHITECTURES=75
-nice -n 10 cmake --build build/native-cuda -j4        # GPU FP32: cppwrf
-cmake -S forecast -B build/forecast -G Ninja
-nice -n 10 cmake --build build/forecast -j4
+tools/build_all.sh        # build/cpu-fp64, build/gpu-fp32, build/gpu-fp64, build/forecast; only what is missing
 ```
 
-`75` is the RTX 2060 (Turing); use your GPU's compute capability.
+The script detects the GPU's compute capability with nvidia-smi, builds one thing at a time under `nice -n 10`
+with at most `-j6`, and passes no floating-point flag (CPPWRF's CMake sets `-ffp-contract=off` and, in FP64 CUDA
+kernels, `--fmad=false`).
 
 WPS 4.6.0, its low-resolution geography and WRF's physics tables are not built here. The pipeline links them,
 read-only, from `WPS_DIR`, `GEOG_DIR` and `WRF_RUN_DIR` (defaults under `~/wrf_real`). No program runs with its

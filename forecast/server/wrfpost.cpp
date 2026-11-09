@@ -20,6 +20,8 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <chrono>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -176,16 +178,22 @@ struct Field {
 }  // namespace
 
 int main(int argc, char** argv) {
+  // --follow: wait until the model run ends (OUT_DIR/.done), then post-process
+  const bool follow = argc == 4 && std::string(argv[1]) == "--follow";
+  if (follow) { ++argv; --argc; }
   if (argc != 3) {
-    std::fprintf(stderr, "usage: wrfpost OUT_DIR PRODUCTS_DIR\n");
+    std::fprintf(stderr, "usage: wrfpost [--follow] OUT_DIR PRODUCTS_DIR\n");
     return 2;
   }
   try {
+    fs::path in = argv[1];
+    while (follow && !fs::exists(in / ".done")) std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    if (fs::exists(in / "d01")) in /= "d01";  // a nested run writes each domain to OUT_DIR/d0N
     std::vector<fs::path> files;
-    for (const auto& e : fs::directory_iterator(argv[1]))
+    for (const auto& e : fs::directory_iterator(in))
       if (e.path().filename().string().rfind("wrfout_d01_", 0) == 0) files.push_back(e.path());
     std::sort(files.begin(), files.end());
-    if (files.empty()) throw std::runtime_error(std::string("no wrfout_d01_* in ") + argv[1]);
+    if (files.empty()) throw std::runtime_error("no wrfout_d01_* in " + in.string());
     const fs::path out = argv[2];
     fs::create_directories(out);
 

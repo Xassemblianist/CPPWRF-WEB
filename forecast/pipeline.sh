@@ -22,9 +22,12 @@ mkdir -p "$RUN/logs"
 STAGE=check
 state() { printf '%s\n' "$*" > "$RUN/state.tmp" && mv "$RUN/state.tmp" "$RUN/state"; }
 fail() { state "failed $STAGE $*"; echo "HATA [$STAGE]: $*" >&2; exit 1; }
-T0=$SECONDS
-begin() { STAGE=$1; T0=$SECONDS; state "$STAGE 0"; }
-finish() { echo "$STAGE $((SECONDS - T0))" >> "$RUN/times"; }
+export LC_ALL=C  # decimal points in the numbers this script writes (times, plan)
+now() { date +%s.%N; }
+since() { awk -v a="$1" -v b="$(now)" 'BEGIN { printf "%.2f", b - a }'; }
+T0=$(now)
+begin() { STAGE=$1; T0=$(now); state "$STAGE 0"; }
+finish() { echo "$STAGE $(since "$T0")" >> "$RUN/times"; }
 free_gb() { df -BG --output=avail "$RUN" | tail -1 | tr -dc 0-9; }
 disk_ok() { [ "$(free_gb)" -gt "$MIN_FREE_GB" ] || fail "Diskte $MIN_FREE_GB GB'tan az boş yer kaldı; eski çalışmaları silin."; }
 
@@ -70,6 +73,7 @@ for h in "${FH[@]}"; do
   k=$((k + 1)); state "download $((100 * k / ${#FH[@]}))"
 done
 echo "GFS: ${#FH[@]} dosya, $((total / 1024 / 1024)) MB" >> "$RUN/logs/download.log"
+echo "$total" > "$RUN/gfs_bytes"
 finish
 
 # ---- 2. WPS in RUN/wps
@@ -87,15 +91,16 @@ for g in "$RUN"/gfs/gfs.f*.grb2; do
 done
 i=0
 for p in geogrid ungrib metgrid; do
+  t=$(now)
   ./$p.exe > "$RUN/logs/$p.log" 2>&1
   if ! grep -q "Successful completion of $p" "$RUN/logs/$p.log"; then
     fail "$p.exe başarısız oldu: $(grep -iE 'error|fatal' "$RUN/logs/$p.log" | tail -2 | tr '\n' ' ')"
   fi
   i=$((i + 1)); state "wps $((100 * i / 3))"
-  echo "$p $((SECONDS - T0))" >> "$RUN/times.wps"
+  echo "$p $(since "$t")" >> "$RUN/times"
 done
+du -sb "$RUN/wps" | cut -f1 > "$RUN/wps_bytes"
 rm -f FILE:* GRIBFILE.* "$RUN"/gfs/*.grb2  # the intermediate files and GFS are no longer needed
-finish
 
 # ---- 3. cppwrf_real in RUN/run
 begin real

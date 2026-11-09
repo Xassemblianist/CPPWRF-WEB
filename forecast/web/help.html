@@ -1,0 +1,82 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CPPWRF Tahmin: Yardım</title>
+<link rel="stylesheet" href="css/app.css">
+<script>try { const t = JSON.parse(localStorage.getItem("cppwrf.theme")); if (t) document.documentElement.dataset.theme = t; } catch {}</script>
+<style>
+  html, body { overflow: auto; height: auto; }
+  main { max-width: 760px; margin: 0 auto; padding: 24px 16px 60px; line-height: 1.6; }
+  h1 { font-size: 24px; } h2 { font-size: 18px; margin-top: 30px; border-bottom: 1px solid var(--line); padding-bottom: 4px; }
+  .warn { border: 1px solid var(--yellow); border-radius: 10px; padding: 12px 14px; background: color-mix(in srgb, var(--yellow) 10%, transparent); }
+  kbd { font-family: var(--mono); font-size: 12px; border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; background: var(--raise); }
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; } td, th { border-bottom: 1px solid var(--line); padding: 5px 6px; text-align: left; vertical-align: top; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+<p><a href="./">← Haritaya dön</a></p>
+<h1>CPPWRF Tahmin: Yardım</h1>
+<p class="warn"><b>Uyarı.</b> Bu site resmî bir hava tahmini değildir. Tahmin, sizin bilgisayarınızda, NOAA'nın GFS küresel modelinin
+verisiyle başlatılan CPPWRF modeliyle üretilir. Sonuç GFS girdisi, seçilen bölge, çözünürlük ve fizik ayarları kadar iyidir.
+Can ve mal güvenliğini ilgilendiren kararlar için Meteoroloji Genel Müdürlüğü'nün resmî tahmin ve uyarılarına bakın.</p>
+
+<h2>Nasıl çalışır</h2>
+<ol>
+  <li><b>GFS indirme.</b> Seçilen GFS çevriminin (00, 06, 12, 18 UTC) bölgeyi kapsayan alt kümesi NOAA NOMADS'tan indirilir: 120 saate kadar saatlik, sonrası 3 saatlik dosyalar.</li>
+  <li><b>WPS.</b> geogrid (arazi, toprak, bitki örtüsü), ungrib (GRIB2 çözme) ve metgrid (yatay aktarım).</li>
+  <li><b>real.</b> CPPWRF'nin <code>cppwrf_real</code> programı başlangıç ve sınır koşullarını hazırlar.</li>
+  <li><b>Model.</b> CPPWRF seçilen kipte çalışır: <i>GPU FP32</i> (hızlı), <i>GPU FP64</i> (WRF ile bit düzeyinde aynı sonuç) ya da <i>CPU FP64</i> (yedek).</li>
+  <li><b>Ürünler.</b> wrfpost her çıktı karesini haritaya uygun enlem-boylam ızgarasına aktarır; kareler hazır oldukça sayfada görünür.</li>
+</ol>
+
+<h2>Yeni tahmin</h2>
+<p>Haritaya tıklayarak alanın merkezini seçin ya da <kbd>Shift</kbd> basılıyken sürükleyerek dikdörtgen çizin. Panel, ayarlarınızın bu
+bilgisayarda ne kadar süreceğini, GPU belleği, RAM, disk ve GFS indirme boyutunu ölçülmüş kalibrasyona göre tahmin eder:</p>
+<ul>
+  <li><b style="color:var(--green)">Yeşil</b>: sorun yok.</li>
+  <li><b style="color:var(--yellow)">Sarı</b>: 30 dakikadan uzun sürecek ya da GPU belleğinin %70'inden fazlası kullanılacak; başlatırken onay istenir.</li>
+  <li><b style="color:var(--red)">Kırmızı</b>: bu makinede çalışamaz (bellek, disk ya da model kısıtı); panel en ucuz düzeltmeyi önerir.</li>
+</ul>
+<p>Zaman adımı varsayılan olarak 6 × dx (km) saniyedir ve çıktı aralığını bölecek biçimde aşağı yuvarlanır. Kararsızlık (CFL) olursa
+adımı küçültün ya da uyarlanır zaman adımını açın. Gelişmiş seçeneklerdeki değerler CPPWRF'nin kendi çeviricisinden gelir; desteklenmeyen
+bir birleşimde hata ilgili ayarın yanında gösterilir.</p>
+
+<h2>Harita</h2>
+<table>
+  <tr><th>Tuş</th><th>İş</th></tr>
+  <tr><td><kbd>1</kbd>–<kbd>9</kbd></td><td>Katman: rüzgâr, hamle, sıcaklık, çiy noktası, nem, basınç, yağış, kar, bulut</td></tr>
+  <tr><td><kbd>←</kbd> <kbd>→</kbd></td><td>Önceki / sonraki kare</td></tr>
+  <tr><td><kbd>Boşluk</kbd></td><td>Oynat / duraklat</td></tr>
+  <tr><td><kbd>+</kbd> <kbd>−</kbd></td><td>Yakınlaştır / uzaklaştır</td></tr>
+  <tr><td><kbd>Esc</kbd></td><td>Nokta kartını ve katman kutusunu kapat</td></tr>
+</table>
+<p>Bir noktaya tıklayınca modelin en yakın ızgara noktasındaki değerler, meteogram ve Skew-T diyagramı açılır. Noktaları kaydedebilirsiniz;
+kayıtlar yalnız bu tarayıcıda tutulur. Birimler ve saat dilimi (varsayılan TSİ) sağ üstteki birim düğmesinden değişir. Sayfanın adresi
+açık katmanı, seviyeyi, kareyi ve harita görünümünü taşır; bağlantıyı paylaşabilirsiniz.</p>
+
+<h2>Ürünlerin yöntemleri</h2>
+<table>
+  <tr><td>Basınç seviyeleri</td><td>Model seviyeleri arasında ln p'de doğrusal (NCEP UPP gibi); arazinin altında boş</td></tr>
+  <tr><td>Deniz seviyesi basıncı</td><td>wrf-python <code>slp</code> (NCL DCOMPUTESEAPRS) indirgemesi</td></tr>
+  <tr><td>Çiy noktası</td><td>Bolton (1980)</td></tr>
+  <tr><td>CAPE / CIN</td><td>Psödoadiyabatik parsel, sanal sıcaklık düzeltmesiyle; SB: 2 m parseli, MU: en alttaki 300 hPa'da en yüksek θe</td></tr>
+  <tr><td>Hamle</td><td>UPP CALGUST: 10 m rüzgârı artı sınır tabaka tepesiyle fark, PBL yüksekliğiyle azaltılmış</td></tr>
+  <tr><td>Bulutluluk</td><td>Basınç bantlarında en büyük bulut kesri (alçak &gt; 680 hPa, orta 680–440, yüksek &lt; 440 hPa); toplam rastgele örtüşme</td></tr>
+  <tr><td>Radar</td><td>Mikrofizik izin verdiğinde (WSM6, Thompson) modelin 10 cm yansıtıcılığı</td></tr>
+</table>
+
+<h2>GitHub Pages ve yerel sunucu</h2>
+<p>Bu sayfa GitHub Pages'te de açılır. Bilgisayarınızda yerel sunucu (<code>127.0.0.1:8090</code>) çalışıyorsa sayfa ona bağlanır ve
+tahmin başlatabilirsiniz; çalışmıyorsa yayımlanmış örnek tahminleri gösterir. Sunucu yalnız bu bilgisayardan erişilebilir.</p>
+
+<h2>Lisans ve veri</h2>
+<p>CPPWRF ve bu site GPL-3.0-or-later lisanslıdır. Kıyı çizgileri, sınırlar, göller, nehirler ve yerleşim adları Natural Earth'tendir
+(kamu malı). Kabartma gölgesi WPS'in GMTED2010 5′ yüksekliğinden üretilir. Başlangıç verisi NOAA GFS'tir.</p>
+</main>
+</body>
+</html>

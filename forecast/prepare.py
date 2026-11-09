@@ -207,7 +207,11 @@ def normalise(s, p):
         "output_min": num(p, t, "output_min", "time.output_min", 10, 360, 60, True),
         "adaptive": bool(t.get("adaptive", False)),
     }
+    # 6 x dx (km) seconds, lowered to a divisor of the output interval: WRF writes on whole steps only
+    out_s = 60 * tim["output_min"]
     suggested = max(1, int(round(6 * dom["dx_km"])))
+    while out_s % suggested:
+        suggested -= 1
     ts = t.get("time_step_s")
     tim["time_step_s"] = suggested if ts is None else num(p, t, "time_step_s", "time.time_step_s", 1, 600, suggested, True)
     tim["suggested_step_s"] = suggested
@@ -261,7 +265,9 @@ def normalise(s, p):
     dyn = {"diff_opt": 2, "km_opt": 4, "diff_6th_opt": 0, "diff_6th_factor": 0.12, "damp_opt": 3, "zdamp": 5000.0,
            "dampcoef": 0.2, "w_damping": 0, "gwd_opt": 1}
     for k, v in (s.get("dynamics") or {}).items():
-        if k not in ctl or ctl[k][1] != "dynamics":
+        if k in dyn and k not in ctl:
+            dyn[k] = v  # a fixed value echoed back from a stored run (re-run)
+        elif k not in ctl or ctl[k][1] != "dynamics":
             p.err(f"dynamics.{k}", f"Bilinmeyen dinamik seçeneği: {k}")
         elif isinstance(v, bool) or not isinstance(v, (int, float)):
             p.err(f"dynamics.{k}", "Sayı olmalı.")
@@ -297,17 +303,35 @@ def projection(dom):
     return proj, tl1, tl2
 
 
-def levels(nz, ptop_hpa):
-    """auto_levels_opt 2: 30 m at the ground, the smallest stretch (and max_dz) whose column reaches the top."""
-    ztop = 7300 * math.log(1013.0 / ptop_hpa) + 2000
-    for s100 in range(105, 131):
-        for mdz in range(800, 2501, 100):
-            z, dz = 0.0, 30.0
-            for _ in range(nz):
-                z += dz
-                dz = min(dz * s100 / 100, mdz)
-            if z >= ztop:
-                return s100 / 100, mdz
+def wrf_levels_ok(nlev, ptop, dzmax, dzbot, s_s, s_u):
+    """True when cppwrf_real's (WRF's) auto_levels_opt = 2 accepts the levels (real_core.hpp levels())."""
+    r_d, g, tt = 287.0, 9.81, 290.0
+    ztop = r_d * tt / g * math.log(1.0e5 / ptop)
+    dz = dzbot
+    zup = [0.0] * (nlev + 1)
+    zup[1] = dz
+    isave = 1
+    for i in range(1, nlev):
+        a = s_u + (s_s - s_u) * max((dzmax * 0.5 - dz) / (dzmax * 0.5), 0.0)
+        dz = a * dz
+        if (ztop - zup[isave]) / (nlev - isave) < dz:
+            break
+        isave = i + 1
+        zup[i + 1] = zup[i] + dz
+        if i == nlev - 1:
+            return False  # not enough eta levels to reach p_top
+    return (ztop - zup[isave]) / (nlev - isave) <= 1.5 * dzmax  # else: upper levels too thick
+
+
+def levels(e_vert, ptop_hpa):
+    """dzstretch (s, u) and max_dz for auto_levels_opt 2: WRF's defaults (dzbot 50 m, 1.3 / 1.1, max_dz 1000 m)
+    when cppwrf_real accepts them for this e_vert and p_top, else the nearest values it accepts."""
+    nlev = e_vert - 1
+    ptop = ptop_hpa * 100.0
+    for mdz in (1000, 1100, 1200, 1300, 1500, 1700, 2000, 2500, 900, 800, 700, 600, 500):
+        for s_s, s_u in ((1.3, 1.1), (1.25, 1.08), (1.2, 1.06), (1.15, 1.04), (1.1, 1.03), (1.35, 1.12), (1.4, 1.15)):
+            if wrf_levels_ok(nlev, ptop, mdz, 50.0, s_s, s_u):
+                return (s_s, s_u), mdz
     return None, None
 
 
@@ -349,11 +373,11 @@ def region_deg2(r):
 DEFAULT_CALIBRATION = {
     "source": "varsayılan (kalibrasyon yok)",
     "stages": {
-        "download_s_per_file": 2.0, "download_s_per_mb": 0.4, "gfs_mb_per_deg2": 0.0085,
+        "download_s_per_file": 15.0, "download_s_per_mb": 0.4, "gfs_mb_per_deg2": 0.034,
         "geogrid_s": 1.0, "geogrid_s_per_cell2d": 4e-5,
         "ungrib_s_per_file": 0.25, "ungrib_s_per_mb": 0.08,
         "metgrid_s_per_file": 0.25, "metgrid_s_per_cell2d_file": 2.0e-6,
-        "real_s": 1.0, "real_s_per_cell3d_file": 6e-8,
+        "real_s": 1.0, "real_s_per_cell3d_file": 6e-8, "model_start_s": 2.0,
         "post_s_per_frame": 0.05, "post_s_per_cell2d_frame": 1.5e-6,
         "met_em_bytes_per_cell2d_file": 2600, "products_bytes_per_cell2d_frame": 60,
         "wrfinput_bytes_per_cell3d": 120,
@@ -410,7 +434,7 @@ def estimate(n, plan, system, mode=None):
     cells3d = cells2d * nz
     nfiles = len(plan["fhours"])
     run_s = tim["hours"] * 3600
-    gfs_mb = nfiles * region_deg2(plan["region"]) * st["gfs_mb_per_deg2"] * 4.0  # 4: all levels and variables
+    gfs_mb = nfiles * region_deg2(plan["region"]) * st["gfs_mb_per_deg2"]
     t = {}
     t["download"] = nfiles * st["download_s_per_file"] + gfs_mb * st["download_s_per_mb"]
     t["geogrid"] = st["geogrid_s"] + cells2d * st["geogrid_s_per_cell2d"]
@@ -426,7 +450,7 @@ def estimate(n, plan, system, mode=None):
         model += (run_s / (radt * 60)) * c3 * md["rad_s_per_cell3d"]
     if tim["adaptive"]:
         model *= 0.7  # the adaptive step is usually longer than 6 dx
-    t["model"] = model
+    t["model"] = model + st.get("model_start_s", 2.0)
     frames = run_s // (tim["output_min"] * 60) + 1
     t["post"] = frames * (st["post_s_per_frame"] + cells2d * st["post_s_per_cell2d_frame"])
     total = sum(t.values())
@@ -608,7 +632,7 @@ def wrf_namelist(n, plan, start_dt, met=None):
  time_step = {tim['time_step_s']}, time_step_fract_num = 0, time_step_fract_den = 1, max_dom = {max_dom},
 {adaptive}
  e_we = {per(dom['nx'] + 1, ne.get('nx', 0) * ne.get('ratio', 3) + 1)}, e_sn = {per(dom['ny'] + 1, ne.get('ny', 0) * ne.get('ratio', 3) + 1)}, e_vert = {per_all(dom['nz'] + 1)},
- auto_levels_opt = 2, dzbot = 30., dzstretch_s = {stretch}, dzstretch_u = {stretch}, max_dz = {maxdz}., p_top_requested = {int(dom['ptop_hpa'] * 100)},
+ auto_levels_opt = 2, dzbot = 50., dzstretch_s = {stretch[0]}, dzstretch_u = {stretch[1]}, max_dz = {maxdz}., p_top_requested = {int(dom['ptop_hpa'] * 100)},
  num_metgrid_levels = {met['levels']}, num_metgrid_soil_levels = {met['soil']},
  dx = {per(dom['dx_m'], dom['dx_m'] / ne.get('ratio', 3))}, dy = {per(dom['dx_m'], dom['dx_m'] / ne.get('ratio', 3))},
  grid_id = {per(1, 2)}, parent_id = {per(0, 1)}, i_parent_start = {per(1, ne.get('i0', 1))}, j_parent_start = {per(1, ne.get('j0', 1))},
@@ -658,7 +682,7 @@ OPTION_FIELD = {"mp_physics", "cu_physics", "bl_pbl_physics", "sf_sfclay_physics
 def translator_field(line):
     """The settings field a translator error is about ('physics.mp_physics'), or ''."""
     import re
-    if "Time step" in line or "time_step /" in line:
+    if "Time step" in line or "time_step /" in line or "time step" in line:
         return "time.time_step_s"
     for m in re.finditer(r"\b([a-z_0-9]+)\s*=", line):
         k = m.group(1)

@@ -74,3 +74,12 @@ distributed under the GNU General Public License.
 - zlib (Jean-loup Gailly and Mark Adler; zlib licence), Emscripten's port.
 - Emscripten's runtime and system libraries (musl libc, libc++, libc++abi; MIT / University of Illinois NCSA
   licences).
+
+## Map data of the forecast site
+
+- `forecast/web/data/ne/*`: Natural Earth v5.1.2 (1:10m, 1:50m and 1:110m coastlines, land, lakes, rivers,
+  boundary lines and populated places), converted by `tools/natural_earth.py`. Natural Earth is in the public domain
+  (https://www.naturalearthdata.com/about/terms-of-use/).
+- `forecast/web/data/relief.bin`: the hill shading of the forecast map, made from the GMTED2010 5-arc-minute
+  terrain height and the MODIS water fraction of WRF's WPS geography data (USGS/NASA products, public domain).
+- No JavaScript library is vendored: the forecast page is plain ES modules and WebGL2.

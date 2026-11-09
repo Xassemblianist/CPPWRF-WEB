@@ -69,7 +69,8 @@ fs::path g_root;
 int g_port = 8090;
 int g_keep_runs = 12;
 std::vector<std::string> g_origins = {"https://xassemblianist.github.io"};  // CPPWRF_ALLOWED_ORIGINS
-thread_local std::string t_cors;  // the CORS headers of the request being answered
+thread_local std::string t_cors;   // the CORS headers of the request being answered
+thread_local std::string t_range;  // its Range header ("bytes=a-b"), for the product files
 std::mutex g_mu;                 // the queue, the child and every run.json write
 std::condition_variable g_cv;
 std::deque<std::string> g_queue;
@@ -339,7 +340,7 @@ void merge_state(const std::string& id, Value& r) {
       std::getline(ss, msg);
       r["message"] = trim(msg);
     } else {
-      r["status"] = a == "download" ? "downloading" : a;
+      r["status"] = "running";
       r["stage"] = a;
       r["pct"] = std::atof(b.c_str());
     }
@@ -454,7 +455,7 @@ void launch(const std::string& id) {
   g_child = pid;
   g_child_id = id;
   Value r = load_run(id);
-  r["status"] = "downloading";
+  r["status"] = "running";
   r["stage"] = "download";
   r["started"] = now_iso();
   r["pgid"] = int(pid);
@@ -583,7 +584,8 @@ void send_all(int fd, const std::string& s) {
 void reply(int fd, int code, const std::string& type, const std::string& body, const std::string& extra = "") {
   const char* text = code == 200 ? "OK" : code == 201 ? "Created" : code == 404 ? "Not Found" : code == 409 ? "Conflict"
                    : code == 413 ? "Payload Too Large" : code == 422 ? "Unprocessable Entity" : code == 405 ? "Method Not Allowed"
-                   : code == 503 ? "Service Unavailable" : code == 403 ? "Forbidden" : "Bad Request";
+                   : code == 503 ? "Service Unavailable" : code == 403 ? "Forbidden" : code == 206 ? "Partial Content"
+                   : code == 416 ? "Range Not Satisfiable" : "Bad Request";
   send_all(fd, "HTTP/1.1 " + std::to_string(code) + " " + text + "\r\nContent-Type: " + type +
                    "\r\nContent-Length: " + std::to_string(body.size()) +
                    "\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n" + t_cors +
@@ -609,7 +611,22 @@ const char* mime(const std::string& p) {
 void send_file(int fd, const fs::path& p, const std::string& cache = "") {
   std::error_code ec;
   if (!fs::is_regular_file(p, ec)) { error_json(fd, 404, "Bulunamadı."); return; }
-  reply(fd, 200, mime(p.string()), read_file(p), cache);
+  // one byte range (the page reads single planes, points and soundings this way)
+  unsigned long long a = 0, b = 0;
+  if (!t_range.empty() && std::sscanf(t_range.c_str(), "bytes=%llu-%llu", &a, &b) == 2 && b >= a) {
+    const auto size = fs::file_size(p, ec);
+    if (a >= size) { reply(fd, 416, "text/plain", "", "Content-Range: bytes */" + std::to_string(size) + "\r\n"); return; }
+    b = std::min<unsigned long long>(b, size - 1);
+    std::string body(b - a + 1, '\0');
+    std::ifstream f(p, std::ios::binary);
+    f.seekg(std::streamoff(a));
+    f.read(body.data(), std::streamsize(body.size()));
+    reply(fd, 206, mime(p.string()), body,
+          "Content-Range: bytes " + std::to_string(a) + "-" + std::to_string(b) + "/" + std::to_string(size) + "\r\n" +
+              "Accept-Ranges: bytes\r\n" + (cache.empty() ? "Cache-Control: no-store\r\n" : cache));
+    return;
+  }
+  reply(fd, 200, mime(p.string()), read_file(p), "Accept-Ranges: bytes\r\n" + (cache.empty() ? "Cache-Control: no-store\r\n" : cache));
 }
 
 // Server-Sent Events: the progress of one run, once a second until it ends
@@ -658,10 +675,14 @@ void events(int fd, const std::string& id) {
         }
       }
     }
+    // the frames wrfpost has finished (meta.json "ready"), so the page can show them during the run
     int frames = 0;
-    std::error_code ec;
-    for (const auto& f : fs::directory_iterator(d / "products", ec))
-      if (f.path().filename().string().rfind("frame_", 0) == 0) ++frames;
+    if (const std::string meta = read_file(d / "products/meta.json"); !meta.empty()) {
+      try {
+        const Value m = json::parse(meta);
+        if (m.has("ready")) frames = int(m["ready"].a.size());
+      } catch (...) { /* being rewritten */ }
+    }
     e["frames"] = frames;
     // the log tail of the running stage
     const std::string stage = r["stage"].str();
@@ -803,8 +824,16 @@ void api(int fd, const std::string& M, const std::vector<std::string>& seg, cons
       send_file(fd, run_path(id) / "logs" / (seg[3] + ".log"));
       return;
     }
-    if (seg.size() == 4 && seg[2] == "products" && M == "GET" && safe_name(seg[3])) {
-      send_file(fd, run_path(id) / "products" / seg[3], seg[3].ends_with(".bin") ? "Cache-Control: max-age=600\r\n" : "");
+    if (seg.size() >= 4 && seg.size() <= 6 && seg[2] == "products" && M == "GET") {
+      // products/<file>, products/<f|n|s>/<file>, products/d0N/[<f|n|s>/]<file>
+      static const std::regex sub("^(f|n|s|d0[2-9])$");
+      fs::path p = run_path(id) / "products";
+      for (size_t i = 3; i + 1 < seg.size(); ++i) {
+        if (!std::regex_match(seg[i], sub)) { error_json(fd, 404, "Bulunamadı."); return; }
+        p /= seg[i];
+      }
+      if (!safe_name(seg.back())) { error_json(fd, 404, "Bulunamadı."); return; }
+      send_file(fd, p / seg.back(), seg.back().ends_with(".f32") ? "Cache-Control: max-age=600\r\n" : "");
       return;
     }
     if ((seg.size() == 4 || seg.size() == 5) && seg[2] == "out" && M == "GET" && safe_name(seg.back()) &&
@@ -853,11 +882,13 @@ void handle(int fd) {
   hs >> method >> path;
   size_t len = 0;
   std::string origin;
+  t_range.clear();
   for (std::string line; std::getline(hs, line);) {
     std::string l = line;
     std::transform(l.begin(), l.end(), l.begin(), ::tolower);
     if (l.rfind("content-length:", 0) == 0) len = size_t(std::atol(l.c_str() + 15));
     if (l.rfind("origin:", 0) == 0) origin = trim(line.substr(7));
+    if (l.rfind("range:", 0) == 0) t_range = trim(l.substr(6));
   }
   // the site may also be opened from GitHub Pages: those origins get CORS (and Private Network Access) headers;
   // any other foreign origin may read nothing and change nothing
@@ -865,11 +896,11 @@ void handle(int fd) {
   const bool same = origin.empty() || origin == "http://127.0.0.1:" + std::to_string(g_port) ||
                     origin == "http://localhost:" + std::to_string(g_port);
   const bool allowed = std::find(g_origins.begin(), g_origins.end(), origin) != g_origins.end();
-  if (allowed) t_cors = "Access-Control-Allow-Origin: " + origin + "\r\nVary: Origin\r\n";
+  if (allowed) t_cors = "Access-Control-Allow-Origin: " + origin + "\r\nVary: Origin\r\nAccess-Control-Expose-Headers: Content-Range\r\n";
   if (method == "OPTIONS") {
     if (!allowed) { error_json(fd, 403, "Bu kaynağa izin yok."); return; }
     send_all(fd, "HTTP/1.1 204 No Content\r\n" + t_cors +
-                     "Access-Control-Allow-Methods: GET, POST, DELETE\r\nAccess-Control-Allow-Headers: Content-Type\r\n"
+                     "Access-Control-Allow-Methods: GET, POST, DELETE\r\nAccess-Control-Allow-Headers: Content-Type, Range\r\n"
                      "Access-Control-Allow-Private-Network: true\r\nAccess-Control-Max-Age: 600\r\n"
                      "Content-Length: 0\r\nConnection: close\r\n\r\n");
     return;

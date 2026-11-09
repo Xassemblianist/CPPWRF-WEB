@@ -20,3 +20,7 @@ target_compile_options(wrfpost PRIVATE -Wall -Wextra)
 add_executable(cppwrf-forecast server/server.cpp)
 target_link_libraries(cppwrf-forecast PRIVATE Threads::Threads)
 target_compile_options(cppwrf-forecast PRIVATE -Wall -Wextra)
+
+# the unit tests of wrfpost's column diagnostics: build/forecast/post_tests
+add_executable(post_tests ${CMAKE_CURRENT_SOURCE_DIR}/../tests/post_tests.cpp)
+target_compile_options(post_tests PRIVATE -Wall -Wextra)

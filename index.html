@@ -5,7 +5,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>CPPWRF-Web</title>
-<meta name="description" content="WRF-ARW v4.8.0 (CPPWRF) running in the browser through WebAssembly, bit-identical to WRF real*8.">
+<meta name="description" content="CPPWRF running in the browser through WebAssembly, bit-identical to WRF real*8.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
@@ -31,9 +31,9 @@
 
 <main class="wrap">
   <header class="hero">
-    <p class="eyebrow">WRF-ARW v4.8.0 · WebAssembly · double precision</p>
+    <p class="eyebrow">CPPWRF · WebAssembly · double precision</p>
     <h1>A thunderstorm, computed in your browser.<br><span>Bit for bit what WRF computes.</span></h1>
-    <p class="lede"><a href="https://github.com/Xassemblianist/CPPWRF">CPPWRF</a>, the C++ port of the WRF model,
+    <p class="lede"><a href="https://github.com/Xassemblianist/CPPWRF">CPPWRF</a>, our C++ atmospheric model,
       compiled to WebAssembly and run in this tab, in double precision. When the hour of model time is done, the
       page hashes every value of the <code>wrfout</code> file it wrote and compares it with the native CPU build of
       CPPWRF, which is bit-identical to WRF real*8.</p>

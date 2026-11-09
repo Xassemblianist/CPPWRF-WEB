@@ -59,8 +59,9 @@ for h in "${FH[@]}"; do
         "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl?dir=%2Fgfs.$C0%2F$CH%2Fatmos&file=gfs.t${CH}z.pgrb2.0p25.$f&all_var=on&all_lev=on&subregion=&toplat=$REGION_N&leftlon=$REGION_W&rightlon=$REGION_E&bottomlat=$REGION_S")
       if [ "$code" = 200 ] && [ "$(head -c 4 "$out.part")" = GRIB ]; then mv "$out.part" "$out"; ok=1; break; fi
       echo "GFS $f: deneme $try başarısız (HTTP $code)" >> "$RUN/logs/download.log"
-      # 404 / an HTML answer: the file is not published (yet, or any more)
-      if [ "$code" = 404 ] || { [ "$code" = 200 ] && grep -qi 'data file is not present\|not exist' "$out.part"; }; then
+      # 404, 403 "Request for Old Data" or an HTML answer: the file is not published (yet, or any more)
+      if [ "$code" = 404 ] || { [ "$code" = 403 ] && grep -qi 'old data' "$out.part"; } ||
+         { [ "$code" = 200 ] && grep -qi 'data file is not present\|not exist' "$out.part"; }; then
         rm -f "$out.part"
         fail "GFS $CYCLE çevriminin $h. saati NOMADS'ta yok (henüz yayımlanmadı ya da arşivden kalktı). Daha eski bir çevrim seçin."
       fi

@@ -194,8 +194,45 @@ def system_name():
     return out.replace("NVIDIA GeForce ", "") or "CPU"
 
 
+def refit_memory(cal, mode, runs_dir):
+    """GPU memory = a + b * cells + c * boundary points x input times, least squares over the finished runs on disk.
+
+    The boundary term matters: every wrfbdy time is held on the device, so a 24 h run of a grid needs more than a
+    3 h run of it. With fewer than four runs, or grids too alike, only a + b * cells is fitted (at least two grids
+    20 % apart); with fewer than two, nothing changes."""
+    pts = []
+    for d in os.listdir(runs_dir):
+        try:
+            r = json.load(open(os.path.join(runs_dir, d, "run.json")))
+        except (OSError, ValueError):
+            continue
+        s, gpu = r.get("settings", {}), r.get("actual", {}).get("gpu_mib")
+        if r.get("status") != "done" or s.get("mode") != mode or not gpu or s.get("nest"):
+            continue
+        dm, nt = s["domain"], len(r.get("derived", {}).get("gfs", {}).get("fhours", []))
+        pts.append((dm["nx"] * dm["ny"] * dm["nz"], 2 * (dm["nx"] + dm["ny"]) * dm["nz"] * nt, gpu))
+    if len(pts) < 2 or max(p[0] for p in pts) < 1.2 * min(p[0] for p in pts):
+        return
+    import numpy as np
+    X = np.array([[1.0, p[0], p[1]] for p in pts])
+    y = np.array([p[2] for p in pts], dtype=float)
+    coef = None
+    if len(pts) >= 4:
+        c, *_ = np.linalg.lstsq(X, y, rcond=None)
+        if (c > 0).all():
+            coef = c
+    if coef is None:
+        c, *_ = np.linalg.lstsq(X[:, :2], y, rcond=None)
+        if (c > 0).all():
+            coef = np.array([c[0], c[1], 0.0])
+    if coef is not None:
+        m = cal["modes"][mode]
+        m["mem_mib"], m["mem_mib_per_cell3d"], m["mem_mib_per_bdy"] = float(coef[0]), float(coef[1]), float(coef[2])
+        m["mem_fit_runs"] = len(pts)
+
+
 def cmd_add(run):
-    """Move the coefficients towards a finished run's numbers (log-space moving average, weight 0.3)."""
+    """Move the time coefficients towards a finished run's numbers (log-space moving average, weight 0.3); refit GPU memory."""
     r = json.load(open(os.path.join(run, "run.json")))
     est, act = r.get("estimate", {}), r.get("actual", {})
     if not est or not act.get("stages_s"):
@@ -226,10 +263,8 @@ def cmd_add(run):
         f = math.exp(w * math.log(a / e))
         for k in ("step_s", "step_s_per_cell3d", "rad_s_per_cell3d"):
             cal["modes"][mode][k] *= f
-    ge, ga = est.get("gpu_mib"), act.get("gpu_mib")
-    if ge and ga and mode.startswith("gpu"):
-        f = math.exp(w * math.log(ga * 1.10 / ge))
-        cal["modes"][mode]["mem_mib_per_cell3d"] *= f
+    if mode.startswith("gpu"):
+        refit_memory(cal, mode, os.path.dirname(os.path.abspath(run)))
     cal["updated_from"] = cal.get("updated_from", 0) + 1
     json.dump(cal, open(CAL, "w"), indent=1)
     return 0

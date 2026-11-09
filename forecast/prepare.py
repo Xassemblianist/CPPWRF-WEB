@@ -454,7 +454,10 @@ def estimate(n, plan, system, mode=None):
     frames = run_s // (tim["output_min"] * 60) + 1
     t["post"] = frames * (st["post_s_per_frame"] + cells2d * st["post_s_per_cell2d_frame"])
     total = sum(t.values())
-    gpu_mib = (md["mem_mib"] + cells3d * md["mem_mib_per_cell3d"]) * 1.10 if mode.startswith("gpu") else 0.0
+    # GPU memory: a fixed part, the 3-D fields, and the lateral boundary data (every input time is held on the device)
+    bdy = 2 * (dom["nx"] + dom["ny"]) * nz * nfiles
+    gpu_mib = (md["mem_mib"] + cells3d * md["mem_mib_per_cell3d"] + bdy * md.get("mem_mib_per_bdy", 0.0)) * 1.10 \
+        if mode.startswith("gpu") else 0.0
     ram_mib = (md["ram_mib"] + cells3d * md["ram_mib_per_cell3d"]) * 1.10
     disk = {
         "gfs": gfs_mb * 1e6,
@@ -625,7 +628,7 @@ def wrf_namelist(n, plan, start_dt, met=None):
  end_year = {per_all(ey.year)}, end_month = {per_all(f'{ey.month:02d}')}, end_day = {per_all(f'{ey.day:02d}')}, end_hour = {per_all(f'{ey.hour:02d}')},
  interval_seconds = {plan['interval_h'] * 3600}, input_from_file = {per_all('.true.')},
  history_interval = {per_all(tim['output_min'])}, frames_per_outfile = {per_all(1)},
- restart = .false., restart_interval = 1000000,
+ restart = .false., restart_interval = {1000 * tim['time_step_s']},
  io_form_history = 2, io_form_restart = 2, io_form_input = 2, io_form_boundary = 2,
  /
  &domains

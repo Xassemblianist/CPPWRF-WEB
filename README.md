@@ -15,13 +15,21 @@ same byte for byte. This holds under node and in Chromium, for both cases ([docs
 
 **Live page:** <https://xassemblianist.github.io/CPPWRF-WEB/>
 
-## Local forecast
+## The forecast site (WEB2)
 
-`forecast/` runs real-data forecasts on your own machine and shows them on a map. A small server on 127.0.0.1
-takes a region and a length from the page and runs GFS → WPS 4.6.0 → `cppwrf_real` → `cppwrf` on the GPU (FP32) or
-the CPU (FP64, WRF-identical). The page then shows wind particles, temperature, rain, humidity, pressure and cloud
-over time. Limits: 150 × 150 × 45 points, 24 h, and a GPU memory and disk check before each run. See
-[docs/FORECAST.md](docs/FORECAST.md).
+`forecast/` is a Turkish weather-forecast site in the manner of Windy that runs real-data CPPWRF forecasts on your
+own machine: GFS → WPS 4.6.0 → `cppwrf_real` → `cppwrf` in one of three modes (GPU FP32, GPU FP64 bit-identical
+to the CPU FP64 build and to WRF, or CPU FP64) → products on a WebGL2 map with 21 layers, a meteogram and a
+Skew-T. Settings are free (dx 1–50 km, 30–100 levels, up to 384 h, nests, every physics option of the
+translator); a panel estimates the time, GPU memory, RAM and disk on this machine before you start.
+
+```bash
+tools/build_all.sh && build/forecast/cppwrf-forecast --port 8090    # then http://127.0.0.1:8090/
+```
+
+The same page runs on GitHub Pages: it uses your local server when it answers on 127.0.0.1:8090, and shows sample
+forecasts otherwise. Technical notes: [docs/FORECAST.md](docs/FORECAST.md). User guide (Turkish):
+[docs/KULLANIM.md](docs/KULLANIM.md). Report: [docs/WEB2_report.md](docs/WEB2_report.md).
 
 ## How bit identity survives the trip to wasm
 
@@ -94,9 +102,9 @@ from the native build with `tools/nc_hashes.py`. The page computes the same hash
 | `web/` | the page (`index.html`, `app.js`, `style.css`), the model's worker (`worker.js`), the hash check (`nchash.js`) |
 | `cases/` | WRF v4.8.0's `input_sounding` and `namelist.input` of each case, and the CPPWRF configuration |
 | `expected/` | the native build's SHA-256 per variable and output time |
-| `tests/` | the math check (`math_bits.cpp`) and the headless node run (`run_node.mjs`) |
+| `tests/` | the math check (`math_bits.cpp`), the headless node run (`run_node.mjs`), wrfpost's diagnostics (`post_tests.cpp`) |
 | `tools/` | the builds of NetCDF-C and of the site, and the hash tool (`nc_hashes.py`) |
-| `forecast/` | the local forecast: the pipeline, the server and post-processor (`server/`), the map page (`web/`) |
+| `forecast/` | the forecast site: settings and estimates (`prepare.py`), the pipeline, the server and post-processor (`server/`), the page (`web/`) |
 | `upstream-patches/` | suggested changes to CPPWRF (none is needed) |
 
 ## Limits

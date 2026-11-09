@@ -147,3 +147,31 @@ GPU memory: estimated 1476 MiB, measured 1319 MiB. Three frames were on the map 
 ![Phone layout](img/web2_m4_mobile.png)
 
 ![Without the local server: the samples](img/web2_m4_pages.jpg)
+
+## M5: end-to-end test, failures, performance, docs (2026-11-09)
+
+**Works**
+
+- `tools/e2e.sh [--case small|perf] [--skip-runs] [--failures]` (driving `tools/e2e.py`): the API checks (11),
+  cancel during the download (status "cancelled", partial files gone), the same case in the three modes on one GFS
+  cycle, GPU FP64 against CPU FP64 with `cmp` on every wrfout, GPU FP32 against GPU FP64 with `tools/ncdiff`
+  (relative L2 per variable), the page in headless Chrome (footer "CPPWRF 36b9b63", legend, TSİ time bar,
+  screenshot) and its frame rate over the DevTools protocol (`tools/page_fps.mjs`).
+- Failures with Turkish messages, tested: a GFS cycle no longer on NOMADS (NOMADS answers 403 "Request for Old
+  Data", which the pipeline now recognises: "… NOMADS'ta yok …"), a time step ten times too large (refused before
+  the run under the time-step field), invalid settings (422 under their fields), oversized requests (413),
+  foreign origins (403).
+- A nest, end to end: 50 × 44 × 35 at 15 km with a 1:3 two-way nest of 16 × 14 parent cells, 3 h, GPU FP32: done
+  in 123 s, products for d01 and d02, both selectable on the map. It first failed in the translator: the
+  namelist's `restart_interval = 1000000` min is not a multiple of the step in a nested run; it is now 1000 steps.
+- The GPU memory estimate now has a boundary term (every wrfbdy time is on the device) and is refitted by least
+  squares after every run; with the earlier one-factor average a 172 × 172 × 45 grid was estimated at 5.3 GB and
+  used 3.1 GB.
+- Docs: README, [FORECAST.md](FORECAST.md) rewritten, [KULLANIM.md](KULLANIM.md) (Turkish user guide).
+
+**Measured**: see [WEB2_report.md](WEB2_report.md) (100 × 100 × 45, 9 km, 24 h in all three modes; largest grids;
+estimate accuracy; frame rates).
+
+![The page in the end-to-end test: the 100 × 100 × 45 run](img/web2_m5_page.png)
+
+![A run with a 1:3 nest (outline in the middle)](img/web2_m5_nest.png)

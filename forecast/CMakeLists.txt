@@ -24,3 +24,8 @@ target_compile_options(cppwrf-forecast PRIVATE -Wall -Wextra)
 # the unit tests of wrfpost's column diagnostics: build/forecast/post_tests
 add_executable(post_tests ${CMAKE_CURRENT_SOURCE_DIR}/../tests/post_tests.cpp)
 target_compile_options(post_tests PRIVATE -Wall -Wextra)
+
+# relative L2 differences of two wrfout files (tools/e2e.sh: FP32 against FP64)
+add_executable(ncdiff ${CMAKE_CURRENT_SOURCE_DIR}/../tools/ncdiff.cpp)
+target_include_directories(ncdiff PRIVATE ${NETCDF_INCDIR})
+target_link_libraries(ncdiff PRIVATE ${NETCDF_LIBRARY})

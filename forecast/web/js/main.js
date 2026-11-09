@@ -50,7 +50,6 @@ class App {
     if (!this.urlView) this.map.setView(39, 35, 4.6);
     await this.connect();
     setInterval(() => this.refreshSystem(), 15000);
-    this.fpsLoop();
   }
 
   // ---- the server, or the samples
@@ -626,17 +625,6 @@ class App {
     body.append(h("label", { class: "fld" }, h("span", {}, t("time.tz")), h("select", { onchange: (e) => prefs.set("tz", e.target.value) },
       ["ist", "utc", "local"].map((k) => h("option", { value: k, selected: prefs.get("tz", "ist") === k }, t(`time.tz.${k}`))))));
     this.dialog(body, [["OK", true]]).then(() => { this.update(); this.paintTimebar(); this.library.render(); });
-  }
-
-  // frames per second of the page (the performance numbers in the docs)
-  fpsLoop() {
-    let n = 0, t0 = performance.now();
-    const tick = (now) => {
-      ++n;
-      if (now - t0 >= 2000) { window.cppwrfFps = Math.round((1000 * n) / (now - t0)); n = 0; t0 = now; }
-      requestAnimationFrame(tick);
-    };
-    requestAnimationFrame(tick);
   }
 }
 

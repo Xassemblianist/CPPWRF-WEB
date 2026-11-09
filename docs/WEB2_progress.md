@@ -110,3 +110,40 @@ GPU memory: estimated 1476 MiB, measured 1319 MiB. Three frames were on the map 
   workers are joined however the program leaves.
 
 ![The point card: Skew-T](img/web2_m3_point.jpg)
+
+## M4: the Turkish viewer (2026-11-09)
+
+**Works**
+
+- WebGL2 map in Web Mercator (`js/map.js`): Natural Earth land and lakes filled through the stencil buffer
+  (1:50m, 1:10m from zoom 4.5), coastlines (1:110m / 1:50m / 1:10m by zoom), borders, rivers, hill shading from
+  WPS's 5′ height, the forecast field as an R32F texture coloured on the GPU through a 256-entry lookup texture,
+  the area outside the domain dimmed, isolines (marching squares; MSLP every 2 hPa, heights every 60 m), wind
+  particles with fading trails, wind barbs, city labels without overlaps. Everything is offline; nothing comes from
+  a CDN. Without WebGL2 (the desktop app's own browser pane has none) the same map is drawn on a 2-D canvas.
+- 21 layers on the right rail, keys 1–9, variants (precipitation: hourly, accumulated, rain, convective,
+  grid-scale; snow; cloud bands; SB / MU), the level selector (surface, 925 … 250 hPa), the nest's domain.
+  Scales are viridis / cividis / plasma ramps and a blue-orange diverging ramp (colour-blind safe); precipitation
+  and radar keep the usual meteorological colours.
+- The time bar with day marks in TSİ ("Pzt 03:00 (TSİ)", +6 sa), play, arrows, drag; hover values in the chosen
+  units; the point card (M3); saved points; units (°C/°F, m/s, km/h, kt, Bofor, hPa/mmHg, mm/in) and the time zone
+  (TSİ, UTC, browser) kept in localStorage; the URL carries run, layer, variant, level, frame and view.
+- Comparison of two runs: side by side with a draggable split, or the difference A − B (B interpolated to A's
+  grid when they differ) on a symmetric diverging scale. GPU FP32 against GPU FP64 for the Ankara case, 2 m
+  temperature after 3 h: at most 0.40 °C apart.
+- Export: PNG (map, particles, legend and time stamp), WebM (MediaRecorder over every ready frame), the current
+  layer as GeoTIFF (float32, EPSG:4326, north up, checked with Pillow: values, ModelPixelScale, ModelTiepoint,
+  GeoKeys, GDAL_NODATA), and the run's wrfout files.
+- Turkish first (`i18n/tr.json`, `en.json`), dark and light themes (`?theme=light` too), a help page with the
+  disclaimer and the methods, keyboard use, labels and live regions for screen readers, a phone layout (drawer as
+  a bottom sheet).
+- GitHub Pages: `tools/build_forecast_site.sh [RUN ...]` assembles `dist/forecast/` with sample forecasts
+  (default: the starred runs). Without a local server the page lists the samples and shows how to start one; with
+  the server on 127.0.0.1:8090 it uses it. Checked by serving `dist/` on another port: the page fell back to the
+  three samples, and the point card and meteogram worked from the static files.
+
+![Light theme, accumulated precipitation](img/web2_m4_light.png)
+
+![Phone layout](img/web2_m4_mobile.png)
+
+![Without the local server: the samples](img/web2_m4_pages.jpg)

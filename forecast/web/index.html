@@ -11,7 +11,8 @@
 <link rel="stylesheet" href="css/app.css">
 <script>
   // the theme before the first paint (the page is dark by default)
-  try { const t = JSON.parse(localStorage.getItem("cppwrf.theme")); if (t) document.documentElement.dataset.theme = t; } catch {}
+  // (?theme=light|dark in the address wins, for links and the page tests)
+  try { const t = new URLSearchParams(location.search).get("theme") || JSON.parse(localStorage.getItem("cppwrf.theme")); if (t) document.documentElement.dataset.theme = t; } catch {}
 </script>
 </head>
 <body>

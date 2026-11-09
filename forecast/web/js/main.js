@@ -31,7 +31,7 @@ class App {
   async start() {
     await loadLang(this.lang);
     $("searchInput").placeholder = t("ui.search");
-    document.documentElement.dataset.theme = prefs.get("theme", "dark");
+    document.documentElement.dataset.theme = new URLSearchParams(location.search).get("theme") || prefs.get("theme", "dark");
     this.map = new MapView($("map"));
     this.map.setTheme(document.documentElement.dataset.theme);
     this.map.drawOverlay = (ctx) => this.overlay(ctx);
@@ -318,7 +318,7 @@ class App {
     const c = conv(1, unit);
     el.replaceChildren(h("div", { class: "ttl" }, h("b", {}, `${t(this.layer.key)}${this.level ? ` · ${this.level} hPa` : ""}${this.cmp?.mode === "diff" ? ` · ${t("cmp.diff")}` : ""}`), h("span", {}, c.label)),
       h("div", { class: "grad", style: `background:${cssGradient(scale)}` }),
-      h("div", { class: "tk" }, (scale.ticks || []).map((v) => h("span", { style: `left:${Math.max(3, Math.min(97, 100 * tickPos(scale, v)))}%` }, num(conv(v, unit).v, Math.abs(v) < 1 && v ? 1 : 0)))));
+      h("div", { class: "tk" }, (scale.ticks || []).filter((v, i, a) => i === 0 || tickPos(scale, v) - tickPos(scale, a[i - 1]) > 0.075).map((v) => h("span", { style: `left:${Math.max(3, Math.min(97, 100 * tickPos(scale, v)))}%` }, num(conv(v, unit).v, Number.isInteger(conv(v, unit).v) ? 0 : Number.isInteger(conv(v, unit).v * 10) ? 1 : 2)))));
     if (this.cmpNote && this.cmp?.mode === "diff") el.append(h("div", { class: "hint", style: "margin:2px 0 0" }, this.cmpNote));
     const L = lut(scale);
     this.legendGradient = [0, 64, 128, 192, 255].map((q) => `rgba(${L[4 * q]},${L[4 * q + 1]},${L[4 * q + 2]},${Math.max(0.3, L[4 * q + 3] / 255)})`);

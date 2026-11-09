@@ -95,14 +95,15 @@ export function geotiff(data, g, name, nodata = "nan") {
   const scale = blob(f64([g.dlon, g.dlat, 0]));
   const tie = blob(f64([0, 0, 0, g.lon0 - g.dlon / 2, g.lat0 + (H - 1) * g.dlat + g.dlat / 2, 0]));
   const keys = blob(u16([1, 1, 0, 3, 1024, 0, 1, 2, 1025, 0, 1, 1, 2048, 0, 1, 4326]));
-  const nd = blob(ascii(nodata));
+  const ndBytes = ascii(nodata);  // 4 bytes or fewer: stored in the entry itself (TIFF 6.0)
+  const nd = ndBytes.byteLength > 4 ? blob(ndBytes) : null;
   const desc = blob(ascii(name));
   const dataOff = base + extraOff;
   add(256, 4, 1, W); add(257, 4, 1, H); add(258, 3, 1, 32); add(259, 3, 1, 1); add(262, 3, 1, 1);
   add(270, 2, name.length + 1, base + desc);
   add(273, 4, 1, dataOff); add(277, 3, 1, 1); add(278, 4, 1, H); add(279, 4, 1, W * H * 4); add(339, 3, 1, 3);
   add(33550, 12, 3, base + scale); add(33922, 12, 6, base + tie); add(34735, 3, 16, base + keys);
-  add(42113, 2, nodata.length + 1, base + nd);
+  entries.push({ tag: 42113, type: 2, count: ndBytes.byteLength, value: nd == null ? 0 : base + nd, inline: nd == null ? ndBytes : null });
   entries.sort((a, b) => a.tag - b.tag);
   const buf = new ArrayBuffer(dataOff + W * H * 4);
   const dv = new DataView(buf);
@@ -111,7 +112,9 @@ export function geotiff(data, g, name, nodata = "nan") {
   entries.forEach((e, i) => {
     const o = 10 + 12 * i;
     dv.setUint16(o, e.tag, true); dv.setUint16(o + 2, e.type, true); dv.setUint32(o + 4, e.count, true);
-    if (e.type === 3 && e.count === 1) dv.setUint16(o + 8, e.value, true); else dv.setUint32(o + 8, e.value, true);
+    if (e.inline) e.inline.forEach((b, k) => dv.setUint8(o + 8 + k, b));
+    else if (e.type === 3 && e.count === 1) dv.setUint16(o + 8, e.value, true);
+    else dv.setUint32(o + 8, e.value, true);
   });
   dv.setUint32(10 + 12 * entries.length, 0, true);
   let o = base;

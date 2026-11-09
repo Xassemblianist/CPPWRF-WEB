@@ -221,6 +221,10 @@ dialog menu { display: flex; justify-content: flex-end; gap: 8px; padding: 0; ma
   #timebar .now { min-width: 92px; font-size: 12px; }
   #legend { left: 8px; right: 60px; width: auto; bottom: 88px; }
   #card { left: 8px; right: 8px; width: auto; bottom: 30px; max-height: 70%; z-index: 9; }
-  footer#foot .lic { display: none; }
+  footer#foot .lic, footer#foot #runTag { display: none; }
+  footer#foot { white-space: nowrap; }
+  footer#foot .disc { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  #tools .icon-btn { width: 30px; height: 30px; }
+  #tools { gap: 0; padding: 2px; }
 }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
